@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""04_join_and_feature_engineer_v7_patched_v8.py
+"""04_join_and_feature_engineer_v7_patched_v9.py
 
 v8 변경점(핵심):
 - Perception object 중 TYPE_SIGN(예: stop_sign)을 TTC/overlap/hit_future 계산 대상에서 제외
   -> stop_sign은 ODD 메타데이터(has_stop_sign 등)로만 사용하고, risk interaction 후보에서 빠져야 정상임.
   -> 결과적으로 09 렌더에서 'TARGET(HIT)/(CONTACT)'로 표지판이 잡히는 현상이 사라짐.
 
+
+v9 변경점(핵심):
+- ego↔object TTC/Hit 후보에서 '반대편 차선/먼 거리 오탐'을 줄이기 위한 휴리스틱 필터 추가
+  (1) Ego-frame lateral offset 필터: |y_ego| > ego_lane_y_max_m 인 pair는 TTC/Hit 계산 결과를 무효화
+  (2) Oncoming heading 필터: |Δheading| >= ego_oncoming_heading_deg 이고 |y_ego| >= ego_oncoming_lateral_min_m 이면 무효화
+  (3) (옵션) range 필터: range_m > ego_candidate_max_range_m 이면 무효화
+  -> 'TARGET(HIT)'가 반대차선/먼 차량에 찍히는 현상을 크게 줄이는 목적(지도/차선 정보 없이 할 수 있는 최소한의 방어선)
 권장:
 - 이 스크립트로 04를 --overwrite 재생성 후 05→06→07을 다시 수행할 것.
 """
@@ -22,6 +29,19 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+import math
+
+
+def _wrap_to_pi(x: np.ndarray) -> np.ndarray:
+    """Wrap angle(s) to [-pi, pi]."""
+    return (x + np.pi) % (2 * np.pi) - np.pi
+
+
+def _abs_heading_diff(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Absolute smallest difference between headings a and b (radians)."""
+    return np.abs(_wrap_to_pi(a - b))
+
 
 
 # -------------------------
@@ -554,7 +574,27 @@ def main() -> None:
 
     ap.add_argument("--max_nodes", type=int, default=0)
 
-    # ✅ NEW: exclude infra objects (e.g., stop_sign) from risk interaction candidates
+    # ✅ NEW(v9): heuristic filters to suppress obvious false "hit" candidates (no map/lane required)
+    ap.add_argument(
+        "--ego_lane_y_max_m", type=float, default=None,
+        help="If set, suppress ego<->object interaction when abs(lateral offset in ego frame) exceeds this (m). "
+             "Typical: 2.5~3.5. This is the most effective quick-fix for opposite-lane false hits."
+    )
+    ap.add_argument(
+        "--ego_oncoming_heading_deg", type=float, default=None,
+        help="If set, suppress ego<->object interaction when abs(heading diff) >= this deg (near-opposite direction). "
+             "Recommended: 150. Use together with ego_oncoming_lateral_min_m to avoid removing true head-on same-lane."
+    )
+    ap.add_argument(
+        "--ego_oncoming_lateral_min_m", type=float, default=2.0,
+        help="Used with ego_oncoming_heading_deg: only suppress if abs(lateral offset) >= this (m). Default 2.0."
+    )
+    ap.add_argument(
+        "--ego_candidate_max_range_m", type=float, default=None,
+        help="(Optional) Suppress ego<->object interaction when range exceeds this (m). Useful if far-away vehicles are frequently selected as TARGET(HIT)." 
+    )
+
+    # ✅ NEW: exclude infra objects (e.g., stop_sign) from risk interaction candidates (e.g., stop_sign) from risk interaction candidates
     ap.add_argument(
         "--exclude_object_types",
         type=str,
@@ -713,6 +753,60 @@ def main() -> None:
                 ego_future_hit_sat=use_ego_future_sat,
             )
 
+            # -------------------------
+            # ✅ NEW(v9): suppress obvious false candidates (opposite lane / oncoming / too far)
+            # We modify the computed matrices *after* TTC/HIT computation by forcing selected ego<->obj pairs to 'no-interaction'.
+            # This is intentionally conservative and only affects ego<->obj edges.
+            if (args.ego_lane_y_max_m is not None) or (args.ego_oncoming_heading_deg is not None) or (args.ego_candidate_max_range_m is not None):
+                cy, sy = float(np.cos(ego_yaw)), float(np.sin(ego_yaw))
+                # ego->obj relative in world (obj - ego)
+                dx = (pos[1:, 0] - pos[0, 0]).astype(np.float32)
+                dy = (pos[1:, 1] - pos[0, 1]).astype(np.float32)
+                # rotate into ego frame (x forward, y left)
+                ego_rel_x = cy * dx + sy * dy
+                ego_rel_y = -sy * dx + cy * dy
+                ego_range = np.sqrt(dx * dx + dy * dy)
+
+                #suppress = np.zeros((pos.shape[0],), dtype=bool)  # for object indices (1..N-1)
+                suppress = np.zeros((max(int(pos.shape[0]) - 1, 0),), dtype=bool)  # for object indices (1..N-1)
+
+
+                # (1) lateral offset filter
+                if args.ego_lane_y_max_m is not None:
+                    suppress |= (np.abs(ego_rel_y) > float(args.ego_lane_y_max_m))
+
+                # (2) oncoming heading filter (near-opposite direction)
+                if args.ego_oncoming_heading_deg is not None:
+                    # heading[0]=ego_yaw, heading[1:]=object heading
+                    hd = _abs_heading_diff(heading[1:], float(ego_yaw))
+                    thr = np.deg2rad(float(args.ego_oncoming_heading_deg))
+                    m_on = (hd >= thr)
+                    lat_min = float(args.ego_oncoming_lateral_min_m) if args.ego_oncoming_lateral_min_m is not None else 0.0
+                    m_on &= (np.abs(ego_rel_y) >= lat_min)
+                    suppress |= m_on
+
+                # (3) optional range filter
+                if args.ego_candidate_max_range_m is not None:
+                    suppress |= (ego_range > float(args.ego_candidate_max_range_m))
+
+                if np.any(suppress):
+                    # suppress ego<->j for suppressed objects
+                    idx_js = (np.where(suppress)[0] + 1).astype(int)
+                    for j in idx_js:
+                        # ego->j and j->ego
+                        ttc[0, j] = np.inf
+                        ttc[j, 0] = np.inf
+                        dtc[0, j] = np.inf
+                        dtc[j, 0] = np.inf
+                        appr[0, j] = 0
+                        appr[j, 0] = 0
+                        coll[0, j] = 0
+                        coll[j, 0] = 0
+                        ov[0, j] = 0
+                        ov[j, 0] = 0
+                        hit[0, j] = 0
+                        hit[j, 0] = 0
+
             N = pos.shape[0]
             if N < 2:
                 continue
@@ -756,6 +850,20 @@ def main() -> None:
                 "l_m": l_m[ii, jj],
                 "d_perp_m": d_perp[ii, jj],
             })
+
+            # fill ego-frame offsets / heading diff for src_is_ego edges (debug & downstream filtering)
+            m_src_ego = (src_is_ego == 1)
+            if np.any(m_src_ego):
+                dxw = df_e.loc[m_src_ego, 'rel_pos_x'].to_numpy(dtype=np.float32, copy=False)
+                dyw = df_e.loc[m_src_ego, 'rel_pos_y'].to_numpy(dtype=np.float32, copy=False)
+                cy, sy = float(np.cos(ego_yaw)), float(np.sin(ego_yaw))
+                df_e.loc[m_src_ego, 'ego_rel_x_m'] = cy * dxw + sy * dyw
+                df_e.loc[m_src_ego, 'ego_rel_y_m'] = -sy * dxw + cy * dyw
+                # heading diff between ego(src) and dst object
+                h_src = heading[ii[m_src_ego]]
+                h_dst = heading[jj[m_src_ego]]
+                df_e.loc[m_src_ego, 'heading_diff_abs_rad'] = _abs_heading_diff(h_dst, h_src)
+
             out_rows.append(df_e)
 
         if out_rows:
@@ -772,4 +880,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
