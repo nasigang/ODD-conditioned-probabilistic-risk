@@ -1,24 +1,14 @@
 from __future__ import annotations
 
-"""Preprocessing utilities for the ODD-conditioned risk pipeline.
+"""Preprocessing utilities (patched v1).
 
-Design goals
-------------
-1) **Raw-space warp compatibility**
-   - We must keep *raw physical units* in the Dataset so that
-     `warp -> scaler.transform` ordering is possible.
-   - Therefore, `transform_dataframe()` only creates numeric columns + targets,
-     and does **NOT** apply z-score scaling.
-
-2) **Safety Pins**
-   - Gate label cleaning (distance/time horizon): `y_gate` uses
-     (n_edges > 0) AND (TTC valid) AND (TTC < ttc_cap)
-   - Expert target stabilization: TTC floor/cap + log + train-standardization
-   - Scaler persistence: Train mean/std are saved and reused.
+Patch goals:
+- Keep raw-space warp compatibility (no scaling inside transform_dataframe).
+- Add flow_x/flow_c split indices to PreprocessState for FiLM conditioning.
 """
 
-from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, asdict, field
+from typing import Dict, List, Tuple
 import json
 
 import numpy as np
@@ -44,8 +34,6 @@ class VarianceFilterState:
 
 @dataclass
 class ScalerState:
-    """Z-score parameters for *continuous* columns only."""
-
     means: Dict[str, float]
     stds: Dict[str, float]
     eps: float = 1e-6
@@ -53,8 +41,6 @@ class ScalerState:
 
 @dataclass
 class TargetStandardizerState:
-    """Standardization parameters for the Expert target y_expert."""
-
     mu_y: float
     sigma_y: float
     eps: float = 1e-6
@@ -70,10 +56,16 @@ class PreprocessState:
     binary_cols: List[str]
     onehot_cols: List[str]
     expert_extra_cols: List[str]
+
     # Expert-only fingerprint suppression.
-    # Indices are with respect to schema.x_expert_cols_in_order().
-    drop_context_cols_expert: List[str] = None
-    drop_context_idx_expert: List[int] = None
+    drop_context_cols_expert: List[str] = field(default_factory=list)
+    drop_context_idx_expert: List[int] = field(default_factory=list)
+
+    # FiLM split cache (indices are w.r.t schema.x_expert_cols_in_order())
+    flow_x_cols: List[str] = field(default_factory=list)
+    flow_c_cols: List[str] = field(default_factory=list)
+    flow_x_idx: List[int] = field(default_factory=list)
+    flow_c_idx: List[int] = field(default_factory=list)
 
     def to_json(self) -> str:
         d = asdict(self)
@@ -83,20 +75,23 @@ class PreprocessState:
     @staticmethod
     def from_json(s: str) -> "PreprocessState":
         d = json.loads(s)
-        schema = FeatureSchema(**d["schema"])
+        schema = FeatureSchema.from_json(json.dumps(d["schema"]))
         d["schema"] = schema
         d["var_filter"] = VarianceFilterState(**d["var_filter"])
         d["scaler"] = ScalerState(**d["scaler"])
         d["target_std"] = TargetStandardizerState(**d["target_std"])
-        # Backward compatibility: older saved states may not include these.
+
+        # Backward compatibility
         d.setdefault("drop_context_cols_expert", [])
         d.setdefault("drop_context_idx_expert", [])
+        d.setdefault("flow_x_cols", [])
+        d.setdefault("flow_c_cols", [])
+        d.setdefault("flow_x_idx", [])
+        d.setdefault("flow_c_idx", [])
         return PreprocessState(**d)
 
 
 def compute_ttc_from_y_soft(y_soft: np.ndarray, eps: float = 1e-6) -> np.ndarray:
-    """Convert TTCI (=1/TTC) to TTC."""
-
     return 1.0 / (y_soft + eps)
 
 
@@ -113,24 +108,12 @@ def standardize_target(y: np.ndarray, ts: TargetStandardizerState) -> np.ndarray
 
 
 def _apply_count_transforms_inplace(df: pd.DataFrame) -> None:
-    """Apply monotonic transforms for heavy-tailed count features."""
-
     for c in ["n_edges", "n_flagged"]:
         if c in df.columns:
             df[c] = np.log1p(pd.to_numeric(df[c], errors="coerce").fillna(0.0).clip(lower=0.0))
 
 
 def _compute_gate_label(df: pd.DataFrame, *, ttc_floor: float, ttc_cap: float, eps: float) -> np.ndarray:
-    """Gate label with a physically meaningful horizon.
-
-    y_gate = (n_edges > 0) AND (TTC valid) AND (TTC < ttc_cap)
-
-    Notes
-    -----
-    - `n_edges` may already be log1p-transformed; the condition ( > 0 ) is stable.
-    - If `min_ttc_est` exists, we prefer it over y_soft.
-    """
-
     if "n_edges" not in df.columns:
         return np.zeros((len(df),), dtype=np.int64)
 
@@ -145,11 +128,9 @@ def _compute_gate_label(df: pd.DataFrame, *, ttc_floor: float, ttc_cap: float, e
         ttc_valid = np.isfinite(y_soft) & (y_soft > 0.0)
         ttc_for_cut = compute_ttc_from_y_soft(np.where(ttc_valid, y_soft, 0.0), eps=eps)
     else:
-        # No TTC proxy available -> Gate cannot be cleaned
         ttc_valid = np.zeros((len(df),), dtype=bool)
         ttc_for_cut = np.full((len(df),), np.inf, dtype=np.float64)
 
-    # IMPORTANT: compare against *raw* TTC (no clipping for the cut)
     y_gate = (edge & ttc_valid & (ttc_for_cut < float(ttc_cap))).astype(np.int64)
     return y_gate
 
@@ -192,8 +173,6 @@ def fit_target_standardizer(
     ttc_cap: float,
     eps: float = 1e-6,
 ) -> TargetStandardizerState:
-    """Fit standardization for y_expert = log(TTC) on positive (expert_mask==1) frames."""
-
     if "y_gate" not in df_train.columns:
         raise ValueError("df_train must include y_gate before fitting target standardizer.")
 
@@ -228,18 +207,6 @@ def _suggest_expert_context_drop(
     uniq_ratio_thr: float = 0.95,
     nan_ratio_thr: float = 0.5,
 ) -> Tuple[List[str], List[int]]:
-    """Identify context (c__*) columns that act as a near-unique segment fingerprint.
-
-    We only target *continuous* c__ columns (no '=' in the name) because:
-      - one-hot ODD features are essential to the paper's claim
-      - many per-segment continuous stats (map counts, speed stats, etc.)
-        are effectively segment_id in disguise under segment-level split.
-
-    Returns:
-      (drop_cols, drop_idx) where drop_idx are indices into
-      schema.x_expert_cols_in_order().
-    """
-
     cols = schema.x_expert_cols_in_order()
     cand = [
         c
@@ -252,7 +219,6 @@ def _suggest_expert_context_drop(
     if not cand:
         return [], []
 
-    # One row per segment (c__ are constant per segment by construction)
     seg = df_train.groupby("segment_id", sort=False)[cand].first()
     nseg = len(seg)
     if nseg == 0:
@@ -279,12 +245,6 @@ def build_preprocess_state(
     ttc_cap: float = 10.0,
     eps: float = 1e-6,
 ) -> PreprocessState:
-    """Fit variance-filter, scaler, and target standardizer on the *train split*.
-
-    This function also produces a **pruned FeatureSchema** so that downstream
-    Dataset/tensors always use the same kept column set.
-    """
-
     if "segment_id" not in df_train.columns:
         raise ValueError("CSV must include segment_id")
     if "n_edges" not in df_train.columns:
@@ -293,25 +253,18 @@ def build_preprocess_state(
         raise ValueError("Need y_soft (TTCI) or min_ttc_est to build labels/targets")
 
     df_train = df_train.copy()
-
-    # Count transforms must be applied BEFORE variance/scaler fitting.
     _apply_count_transforms_inplace(df_train)
-
-    # Gate label
     df_train["y_gate"] = _compute_gate_label(df_train, ttc_floor=ttc_floor, ttc_cap=ttc_cap, eps=eps)
 
-    # Variance filter on all candidate features (Gate + Expert extras)
     candidate_cols = schema.x_gate_cont + schema.x_gate_bin + schema.x_gate_onehot + schema.x_expert_extra_cont
     vf = fit_variance_filter(df_train, candidate_cols)
     kept = set(vf.kept_columns)
 
-    # Prune schema to kept cols
     gate_onehot = [c for c in schema.x_gate_onehot if c in kept]
     gate_bin = [c for c in schema.x_gate_bin if c in kept]
     gate_cont = [c for c in schema.x_gate_cont if (c in kept and c not in gate_onehot and c not in gate_bin)]
     expert_extra = [c for c in schema.x_expert_extra_cont if c in kept]
 
-    # Train-based binary detection (move from cont->bin for Gate only)
     gate_cont_final: List[str] = []
     gate_bin_final: List[str] = list(gate_bin)
     for c in gate_cont:
@@ -320,7 +273,6 @@ def build_preprocess_state(
         else:
             gate_cont_final.append(c)
 
-    # Binary expert-extra columns should NOT be z-scored
     expert_bin = [c for c in expert_extra if (c in df_train.columns and _is_binary_series(df_train[c]))]
 
     onehot_cols = sorted(set(gate_onehot))
@@ -341,9 +293,14 @@ def build_preprocess_state(
         target_cols=list(schema.target_cols),
     )
 
-    # Expert-only: auto-drop context continuous columns that effectively act as a
-    # segment fingerprint ...
     drop_cols_expert, drop_idx_expert = _suggest_expert_context_drop(df_train, new_schema)
+
+    # FiLM split cache
+    expert_cols = new_schema.x_expert_cols_in_order()
+    flow_x_cols = [c for c in expert_cols if not c.startswith("c__")]
+    flow_c_cols = [c for c in expert_cols if c.startswith("c__")]
+    flow_x_idx = [i for i, c in enumerate(expert_cols) if not c.startswith("c__")]
+    flow_c_idx = [i for i, c in enumerate(expert_cols) if c.startswith("c__")]
 
     return PreprocessState(
         schema=new_schema,
@@ -356,6 +313,10 @@ def build_preprocess_state(
         expert_extra_cols=sorted(set(expert_extra)),
         drop_context_cols_expert=drop_cols_expert,
         drop_context_idx_expert=drop_idx_expert,
+        flow_x_cols=flow_x_cols,
+        flow_c_cols=flow_c_cols,
+        flow_x_idx=flow_x_idx,
+        flow_c_idx=flow_c_idx,
     )
 
 
@@ -367,26 +328,11 @@ def transform_dataframe(
     ttc_cap: float = 10.0,
     eps: float = 1e-6,
 ) -> pd.DataFrame:
-    """Create model-ready numeric columns + targets.
-
-    IMPORTANT
-    ---------
-    - Keeps **raw** feature values (no z-score scaling).
-    - Adds/overwrites the following columns:
-        y_gate (0/1)
-        y_expert (standardized log TTC)
-        expert_mask (0/1)
-    """
-
     out = df.copy()
-
-    # Consistent transforms
     _apply_count_transforms_inplace(out)
 
-    # Gate label
     out["y_gate"] = _compute_gate_label(out, ttc_floor=ttc_floor, ttc_cap=ttc_cap, eps=eps).astype(np.float32)
 
-    # TTC -> log TTC -> standardized target
     if "min_ttc_est" in out.columns:
         ttc_raw = pd.to_numeric(out["min_ttc_est"], errors="coerce").to_numpy(np.float64)
         ttc_raw = np.where(np.isfinite(ttc_raw) & (ttc_raw > 0), ttc_raw, np.inf)
@@ -400,7 +346,6 @@ def transform_dataframe(
     out["y_expert"] = standardize_target(y_log, state.target_std).astype(np.float32)
     out["expert_mask"] = out["y_gate"].astype(np.float32)
 
-    # Ensure all feature columns exist and are numeric
     feat_cols = state.schema.x_expert_cols_in_order()
     for c in feat_cols:
         if c not in out.columns:
@@ -410,7 +355,6 @@ def transform_dataframe(
 
     out[feat_cols] = out[feat_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-    # Keep identifiers as-is
     if "segment_id" in out.columns:
         out["segment_id"] = out["segment_id"].astype(str)
     if "frame_label" in out.columns:

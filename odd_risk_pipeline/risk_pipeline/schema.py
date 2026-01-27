@@ -37,6 +37,11 @@ class FeatureSchema:
     id_cols: List[str]
     target_cols: List[str]
 
+    # Optional: split conditioning for Expert/Flow (for FiLM / coupling-conditioning experiments)
+    # If not provided, Flow uses x_expert_cols_in_order() as a single concatenated conditioning.
+    flow_x_cols: List[str] = None
+    flow_c_cols: List[str] = None
+
     # ------------------------------------------------------------------
     # Deterministic column ordering helpers
     # ------------------------------------------------------------------
@@ -57,6 +62,22 @@ class FeatureSchema:
         """
         return self.x_gate_cols_in_order() + list(self.x_expert_extra_cont)
 
+    # --------------------------
+    # Optional Flow split helpers
+    # --------------------------
+    def flow_x_cols_in_order(self) -> List[str]:
+        if self.flow_x_cols:
+            return list(self.flow_x_cols)
+        return self.x_expert_cols_in_order()
+
+    def flow_c_cols_in_order(self) -> List[str]:
+        if self.flow_c_cols:
+            return list(self.flow_c_cols)
+        return []
+
+    def flow_cond_cols_in_order(self) -> List[str]:
+        return self.flow_x_cols_in_order() + self.flow_c_cols_in_order()
+
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
 
@@ -70,7 +91,7 @@ def _match_regex(cols: Sequence[str], pattern: str) -> List[str]:
     return [c for c in cols if rgx.match(c)]
 
 
-def build_schema_from_columns(columns: Sequence[str], context_mode: str = "all") -> FeatureSchema:
+def build_schema_from_columns(columns: Sequence[str], context_mode: str = "all", *, flow_feature_split: str = "none") -> FeatureSchema:
     cols = list(columns)
 
     mode = (context_mode or "all").lower().strip()
@@ -173,6 +194,46 @@ def build_schema_from_columns(columns: Sequence[str], context_mode: str = "all")
     x_gate_bin = sorted(set(x_gate_bin + c_bin))
     x_gate_cont = sorted(set(x_gate_cont + c_cont))
 
+
+    # ------------------------------------------------------------------
+    # Optional: split Flow conditioning into (flow_x, flow_c)
+    # - "none": keep legacy (single concatenated conditioning)
+    # - "auto": treat all c__ as context + selected x__ (near/dist/lidar/occlusion/density) as context
+    # ------------------------------------------------------------------
+    split_mode = (flow_feature_split or "none").lower().strip()
+    if split_mode not in {"none", "auto"}:
+        raise ValueError(f"Invalid flow_feature_split={flow_feature_split!r}. Use 'none' or 'auto'.")
+
+    # Expert conditioning columns (legacy ordering)
+    expert_cols_order = (list(x_gate_cont) + list(x_gate_bin) + list(x_gate_onehot) + list(x_expert_extra_cont))
+
+    if split_mode == "none":
+        flow_x_cols = list(expert_cols_order)
+        flow_c_cols = []
+    else:
+        # Always include c__* (context) in flow_c
+        flow_c_cols = [c for c in expert_cols_order if c.startswith("c__")]
+
+        # Also treat some x__ as context-like signals (perception/density/near-dist proxies)
+        flow_c_x_patterns = (
+            r"^x__near_",
+            r"^x__min_range_",
+            r"^x__max_closing_speed_",
+            r"^x__closing_speed_",
+            r"^x__appr_cnt_",
+            r"^x__density$",
+            r"^x__mean_lidar_points",
+            r"^x__occlusion",
+        )
+        for c in expert_cols_order:
+            if c.startswith("x__") and any(re.match(p, c) for p in flow_c_x_patterns):
+                flow_c_cols.append(c)
+
+        # keep original order
+        flow_c_cols = sorted(set(flow_c_cols), key=lambda x: expert_cols_order.index(x))
+        flow_x_cols = [c for c in expert_cols_order if c not in set(flow_c_cols)]
+
+
     return FeatureSchema(
         x_gate_cont=x_gate_cont,
         x_gate_bin=x_gate_bin,
@@ -180,6 +241,8 @@ def build_schema_from_columns(columns: Sequence[str], context_mode: str = "all")
         x_expert_extra_cont=x_expert_extra_cont,
         id_cols=id_cols,
         target_cols=sorted(set(target_cols)),
+        flow_x_cols=flow_x_cols,
+        flow_c_cols=flow_c_cols,
     )
 
 
