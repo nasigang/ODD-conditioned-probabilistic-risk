@@ -8,6 +8,75 @@ import torch
 import argparse
 import os
 
+import re
+from typing import Dict, List, Tuple, Iterable
+
+def _parse_csv_list(s: str) -> List[str]:
+    if not s:
+        return []
+    return [x.strip() for x in s.split(',') if x.strip()]
+
+def _build_x_to_c_rename_map(columns: Iterable[str], patterns: List[str]) -> Dict[str, str]:
+    """Rename x__* columns to c__* if any regex pattern matches the column name."""
+    if not patterns:
+        return {}
+    regs = [re.compile(p) for p in patterns]
+    cols = list(columns)
+    colset = set(cols)
+    rename: Dict[str, str] = {}
+    for col in cols:
+        if not col.startswith('x__'):
+            continue
+        if any(r.search(col) for r in regs):
+            new = 'c__' + col[len('x__'):]
+            if new in colset and new != col:
+                raise ValueError(f"[x_to_c] rename collision: {col} -> {new} already exists in dataframe.")
+            rename[col] = new
+    return rename
+
+def _apply_rename(df: 'pd.DataFrame', rename: Dict[str, str]) -> 'pd.DataFrame':
+    return df.rename(columns=rename) if rename else df
+
+def _schema_expected_columns(schema) -> List[str]:
+    expected = set()
+    for attr in dir(schema):
+        if 'cols' not in attr:
+            continue
+        try:
+            v = getattr(schema, attr)
+        except Exception:
+            continue
+        if isinstance(v, (list, tuple)) and v and all(isinstance(x, str) for x in v):
+            expected.update(v)
+    return sorted(expected)
+
+def _auto_align_xc_prefix_swap(df: 'pd.DataFrame', schema) -> Tuple['pd.DataFrame', Dict[str, str]]:
+    """If schema expects c__foo but df has x__foo (or vice versa), rename automatically."""
+    expected = _schema_expected_columns(schema)
+    cols = set(df.columns)
+    rename: Dict[str, str] = {}
+    for exp in expected:
+        if exp in cols:
+            continue
+        if exp.startswith('c__'):
+            alt = 'x__' + exp[len('c__'):]
+        elif exp.startswith('x__'):
+            alt = 'c__' + exp[len('x__'):]
+        else:
+            continue
+        if alt in cols and exp not in cols:
+            rename[alt] = exp
+    if rename:
+        df = df.rename(columns=rename)
+    return df, rename
+
+def _match_cols_by_regex(colnames: List[str], patterns: List[str]) -> List[str]:
+    if not patterns:
+        return []
+    regs = [re.compile(p) for p in patterns]
+    return [c for c in colnames if any(r.search(c) for r in regs)]
+
+
 from risk_pipeline.schema import build_schema_from_columns, save_schema
 from risk_pipeline.preprocess import build_preprocess_state, transform_dataframe, save_preprocess_state
 from risk_pipeline.data import RiskCSVDataset, SegmentBalancedBatchSampler, SegmentBalancedPosBatchSampler, make_dataloader
@@ -79,6 +148,32 @@ def main():
             "Gate will still see c__ features (controlled by --context_mode)."
         ),
     )
+    ap.add_argument("--x_to_c_regex", type=str, default="",
+                    help="Comma-separated regex. Matching x__* columns will be renamed to c__* (role remap without re-export).")
+    ap.add_argument("--expert_drop_feature_regex", type=str, default="",
+                    help="Comma-separated regex. Matching expert feature columns will be hard-dropped (set to train-mean) for flow, in both train+eval.")
+    ap.add_argument(
+        "--flow_feature_split",
+        type=str,
+        default="none",
+        choices=["none", "auto"],
+        help=(
+            "How to split Expert features into (x_part, c_cond) for Flow conditioning. "
+            "'none' keeps legacy behavior (all expert features as one concat condition). "
+            "'auto' sets c_cond = all c__* plus selected x__ (near/dist/lidar/occlusion/density/closing-speed proxies)."
+        ),
+    )
+    ap.add_argument(
+        "--flow_cond_mode",
+        type=str,
+        default="concat",
+        choices=["concat", "film"],
+        help=(
+            "How to inject conditioning into the Flow. 'concat' = legacy MLP on concatenated condition. "
+            "'film' = FiLM conditioning inside coupling network (strong c_cond injection)."
+        ),
+    )
+
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
@@ -93,6 +188,13 @@ def main():
         leak_cols = [c for c in ["label", "x__best_ttci", "best_ttci"] if c in df.columns]
         if leak_cols:
             df = df.drop(columns=leak_cols)
+
+    # --- Optional role remap: x__ -> c__ (fast ablation without re-export) ---
+    x_to_c_patterns = _parse_csv_list(args.x_to_c_regex)
+    rename_map = _build_x_to_c_rename_map(df.columns, x_to_c_patterns)
+    if rename_map:
+        print(f"[x_to_c] renaming {len(rename_map)} columns (x__ -> c__). Example: {list(rename_map.items())[:5]}")
+        df = _apply_rename(df, rename_map)
 
     df_train, df_val, df_test = split_by_segment(
         df, seed=args.seed, val_ratio=args.val_ratio, test_ratio=args.test_ratio
@@ -112,7 +214,7 @@ def main():
         json.dump(split_map, f, indent=2)
 
     # 1) Schema is inferred from CSV headers.
-    schema0 = build_schema_from_columns(df_train.columns, context_mode=args.context_mode)
+    schema0 = build_schema_from_columns(df_train.columns, context_mode=args.context_mode, flow_feature_split=args.flow_feature_split)
     if (len(schema0.x_gate_cont) + len(schema0.x_gate_bin) + len(schema0.x_gate_onehot)) == 0:
         raise RuntimeError(
             "Schema matched zero features. Check x__/c__ prefixes and that ODD one-hot columns look like c__odd_weather=Rain."
@@ -227,7 +329,17 @@ def main():
                 break
 
     # --- Expert Training ---
-    flow = ConditionalSpline1DFlow(cond_dim=ds_train.tensors.x_expert_raw.shape[1], hidden=args.hidden, depth=args.depth, dropout=args.dropout).to(device)
+    if args.flow_cond_mode == "concat":
+        flow = ConditionalSpline1DFlow(cond_dim=ds_train.tensors.x_expert_raw.shape[1], hidden=args.hidden, depth=args.depth, dropout=args.dropout).to(device)
+    else:
+        x_dim = len(getattr(state, "flow_x_idx", []) or [])
+        c_dim = len(getattr(state, "flow_c_idx", []) or [])
+        if c_dim <= 0:
+            raise RuntimeError("flow_cond_mode=film requires c_dim>0. Use --flow_feature_split auto and/or provide c__ features.")
+        if x_dim <= 0:
+            raise RuntimeError("flow_cond_mode=film requires x_dim>0 (non-context features).")
+        flow = ConditionalSpline1DFlow(cond_mode="film", x_dim=x_dim, c_dim=c_dim, hidden=args.hidden, depth=args.depth, dropout=args.dropout).to(device)
+        print(f"[Flow FiLM] x_dim={x_dim} c_dim={c_dim} (flow_c_cols={len(getattr(state, 'flow_c_cols', []))})")
 
     # Expert fingerprint guard: optionally drop c__ continuous segment-stat features (set to train mean => scaled 0)
     expert_colnames = ds_train.get_x_expert_colnames()
@@ -250,6 +362,15 @@ def main():
         # Permanently remove all segment-level context c__* from Expert (both train & eval).
         drop_idx.extend(ctx_all_idx)
         ctx_all_idx = []  # disable stochastic block-drop when we're already hard-dropping
+    # --- Extra expert hard-drop by regex (optional) ---
+    extra_drop_patterns = _parse_csv_list(args.expert_drop_feature_regex)
+    if extra_drop_patterns:
+        extra_cols = _match_cols_by_regex(expert_colnames, extra_drop_patterns)
+        if extra_cols:
+            extra_idx = [expert_colnames.index(c) for c in extra_cols]
+            print(f"[expert_drop_feature_regex] hard-drop {len(extra_idx)} expert cols. Example: {extra_cols[:10]}")
+            drop_idx.extend(extra_idx)
+
     drop_idx = sorted(set(drop_idx))
 
     drop_idx_t = torch.tensor(drop_idx, dtype=torch.long, device=device) if len(drop_idx) else None
@@ -270,8 +391,10 @@ def main():
             drop_idx=drop_idx_t,
             ctx_all_idx=ctx_all_idx_t,
             ctx_block_drop_prob=args.expert_ctx_block_drop_prob,
+            flow_x_idx=getattr(state, 'flow_x_idx', None),
+            flow_c_idx=getattr(state, 'flow_c_idx', None),
         )
-        va = eval_expert_raw(flow, expert_val_loader, device, expert_mean, expert_std, drop_idx=drop_idx_t)
+        va = eval_expert_raw(flow, expert_val_loader, device, expert_mean, expert_std, drop_idx=drop_idx_t, flow_x_idx=getattr(state,'flow_x_idx',None), flow_c_idx=getattr(state,'flow_c_idx',None))
         scheduler.step(va)
         
         print(f"[Expert] epoch {ep+1}/{cfg.expert_epochs} train_nll={tr:.4f} val_nll={va:.4f} lr={optimizer.param_groups[0]['lr']:.2e}")
@@ -303,7 +426,8 @@ def main():
     logits = gate(xg)
 
     rcfg = RiskConfig(tau=0.7, a_max=6.0, ttc_floor=args.ttc_floor, ttc_cap=args.ttc_cap)
-    risk, p_gate = compute_risk(logits, flow, xe, v_close, state.target_std, rcfg)
+    xe_cond = (xe[:, state.flow_x_idx], xe[:, state.flow_c_idx]) if (flow.expects_tuple_condition() if callable(getattr(flow, 'expects_tuple_condition', None)) else bool(getattr(flow, 'expects_tuple_condition', False))) else xe
+    risk, p_gate = compute_risk(logits, flow, xe_cond, v_close, state.target_std, rcfg)
 
     stats = {
         "risk_mean": float(risk.mean().item()),
