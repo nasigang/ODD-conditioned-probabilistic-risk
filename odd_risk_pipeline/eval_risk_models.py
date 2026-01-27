@@ -22,6 +22,75 @@ import numpy as np
 import pandas as pd
 import torch
 
+import re
+from typing import Dict, List, Tuple, Iterable
+
+def _parse_csv_list(s: str) -> List[str]:
+    if not s:
+        return []
+    return [x.strip() for x in s.split(',') if x.strip()]
+
+def _build_x_to_c_rename_map(columns: Iterable[str], patterns: List[str]) -> Dict[str, str]:
+    """Rename x__* columns to c__* if any regex pattern matches the column name."""
+    if not patterns:
+        return {}
+    regs = [re.compile(p) for p in patterns]
+    cols = list(columns)
+    colset = set(cols)
+    rename: Dict[str, str] = {}
+    for col in cols:
+        if not col.startswith('x__'):
+            continue
+        if any(r.search(col) for r in regs):
+            new = 'c__' + col[len('x__'):]
+            if new in colset and new != col:
+                raise ValueError(f"[x_to_c] rename collision: {col} -> {new} already exists in dataframe.")
+            rename[col] = new
+    return rename
+
+def _apply_rename(df: 'pd.DataFrame', rename: Dict[str, str]) -> 'pd.DataFrame':
+    return df.rename(columns=rename) if rename else df
+
+def _schema_expected_columns(schema) -> List[str]:
+    expected = set()
+    for attr in dir(schema):
+        if 'cols' not in attr:
+            continue
+        try:
+            v = getattr(schema, attr)
+        except Exception:
+            continue
+        if isinstance(v, (list, tuple)) and v and all(isinstance(x, str) for x in v):
+            expected.update(v)
+    return sorted(expected)
+
+def _auto_align_xc_prefix_swap(df: 'pd.DataFrame', schema) -> Tuple['pd.DataFrame', Dict[str, str]]:
+    """If schema expects c__foo but df has x__foo (or vice versa), rename automatically."""
+    expected = _schema_expected_columns(schema)
+    cols = set(df.columns)
+    rename: Dict[str, str] = {}
+    for exp in expected:
+        if exp in cols:
+            continue
+        if exp.startswith('c__'):
+            alt = 'x__' + exp[len('c__'):]
+        elif exp.startswith('x__'):
+            alt = 'c__' + exp[len('x__'):]
+        else:
+            continue
+        if alt in cols and exp not in cols:
+            rename[alt] = exp
+    if rename:
+        df = df.rename(columns=rename)
+    return df, rename
+
+def _match_cols_by_regex(colnames: List[str], patterns: List[str]) -> List[str]:
+    if not patterns:
+        return []
+    regs = [re.compile(p) for p in patterns]
+    return [c for c in colnames if any(r.search(c) for r in regs)]
+
+
 # sklearn is convenient; fallback gracefully if missing
 try:
     from sklearn.metrics import roc_auc_score, average_precision_score
@@ -296,35 +365,49 @@ def _infer_mlp_dims_from_sd(sd: Dict[str, torch.Tensor], *, prefix: Optional[str
     return in_dim, hidden, depth
 
 
-def _infer_flow_hparams_from_sd(flow_sd: Dict[str, torch.Tensor]) -> Tuple[int, int, int]:
-    """
-    Infer (hidden, depth, num_bins) for ConditionalSpline1DFlow based on its `net.*.weight` shapes.
-    out_dim should be 3*num_bins + 1.
-    depth is #hidden layers (not counting final output linear).
-    """
-    lin_keys = [k for k, v in flow_sd.items() if k.startswith("net.") and k.endswith(".weight") and getattr(v, "ndim", 0) == 2]
-    if not lin_keys:
-        raise RuntimeError("Could not find flow linear weights under net.*.weight")
+def _infer_flow_arch_from_sd(flow_sd: Dict[str, torch.Tensor]) -> Dict[str, int]:
+    # Returns a dict with keys:
+    #  - mode in {"concat","film"}
+    #  - hidden, depth, num_bins
+    #  - cond_dim (concat) OR x_dim,c_dim (film)
 
-    def _net_idx(k: str) -> int:
-        # "net.6.weight" -> 6
-        try:
-            return int(k.split(".")[1])
-        except Exception:
-            return -1
+    # Legacy concat: parameters live under net.*
+    net_w = [(k, v) for k, v in flow_sd.items() if k.startswith("net.") and k.endswith(".weight") and getattr(v, "ndim", 0) == 2]
+    if net_w:
+        net_w_sorted = sorted(net_w, key=lambda kv: int(kv[0].split(".")[1]))
+        cond_dim = int(net_w_sorted[0][1].shape[1])
+        hidden = int(net_w_sorted[0][1].shape[0])
+        out_dim = int(net_w_sorted[-1][1].shape[0])
+        num_bins = (out_dim - 1) // 3
+        # depth parameter in models.py corresponds to (#Linear layers in net) - 1 (head excluded)
+        depth = max(1, len(net_w_sorted) - 1)
+        return {"mode": "concat", "cond_dim": cond_dim, "hidden": hidden, "depth": depth, "num_bins": num_bins}
 
-    lin_keys_sorted = sorted(lin_keys, key=_net_idx)
-    first_w = flow_sd[lin_keys_sorted[0]]
-    last_w = flow_sd[lin_keys_sorted[-1]]
+    # FiLM: trunk.* and head.* plus film.net.*
+    trunk_w = [(k, v) for k, v in flow_sd.items() if k.startswith("trunk.") and k.endswith(".weight") and getattr(v, "ndim", 0) == 2]
+    head_w = flow_sd.get("head.weight", None)
+    film_w0 = flow_sd.get("film.net.0.weight", None)
+    if trunk_w and head_w is not None and film_w0 is not None:
+        trunk_w_sorted = sorted(trunk_w, key=lambda kv: int(kv[0].split(".")[1]))
+        x_dim = int(trunk_w_sorted[0][1].shape[1])
+        hidden = int(trunk_w_sorted[0][1].shape[0])
+        out_dim = int(head_w.shape[0])
+        num_bins = (out_dim - 1) // 3
+        # trunk has exactly `depth` Linear layers
+        depth = int(len(trunk_w_sorted))
+        c_dim = int(film_w0.shape[1])
+        return {"mode": "film", "x_dim": x_dim, "c_dim": c_dim, "hidden": hidden, "depth": depth, "num_bins": num_bins}
 
-    hidden = int(first_w.shape[0])
-    out_dim = int(last_w.shape[0])
-    num_bins = int((out_dim - 1) // 3)
-    if (3 * num_bins + 1) != out_dim:
-        raise RuntimeError(f"Flow out_dim={out_dim} not compatible with num_bins (expected out_dim=3K+1).")
-    depth = max(1, len(lin_keys_sorted) - 1)
-    return hidden, depth, num_bins
+    raise RuntimeError("Could not infer Flow architecture from checkpoint keys. Expected net.* (concat) or trunk/head/film.* (FiLM).")
 
+
+def _make_flow_cond(x_expert_std: torch.Tensor, flow: torch.nn.Module, flow_x_idx=None, flow_c_idx=None):
+    # Prepare conditioning for both concat and FiLM Flow.
+    if (flow.expects_tuple_condition() if callable(getattr(flow, 'expects_tuple_condition', None)) else bool(getattr(flow, 'expects_tuple_condition', False))):
+        if flow_x_idx is None or flow_c_idx is None or len(flow_x_idx) == 0 or len(flow_c_idx) == 0:
+            raise RuntimeError("FiLM Flow requires non-empty flow_x_idx and flow_c_idx (check preprocess_state.json and --flow_feature_split).")
+        return (x_expert_std[:, flow_x_idx], x_expert_std[:, flow_c_idx])
+    return x_expert_std
 
 def load_models_for_run(run_dir: Path, state, device: torch.device):
     """
@@ -354,11 +437,17 @@ def load_models_for_run(run_dir: Path, state, device: torch.device):
 
     if flow_ckpt.exists():
         flow_sd = _torch_load_sd(flow_ckpt, device=torch.device("cpu"))
-        ctx_dim = len(state.schema.x_expert_cols_in_order())
-        f_hidden, f_depth, num_bins = _infer_flow_hparams_from_sd(flow_sd)
-        expert = ConditionalSpline1DFlow(
-            cond_dim=ctx_dim, num_bins=num_bins, hidden=f_hidden, depth=f_depth, dropout=0.0
-        ).to(device)
+        arch = _infer_flow_arch_from_sd(flow_sd)
+        if arch["mode"] == "concat":
+            ctx_dim = len(state.schema.x_expert_cols_in_order())
+            expert = ConditionalSpline1DFlow(
+                cond_dim=ctx_dim, num_bins=arch["num_bins"], hidden=arch["hidden"], depth=arch["depth"], dropout=0.0
+            ).to(device)
+        else:
+            expert = ConditionalSpline1DFlow(
+                cond_mode="film", x_dim=arch["x_dim"], c_dim=arch["c_dim"], num_bins=arch["num_bins"], hidden=arch["hidden"], depth=arch["depth"], dropout=0.0
+            ).to(device)
+
         expert.load_state_dict(flow_sd, strict=True)
         expert.eval()
         return gate, expert, "flow"
@@ -440,6 +529,8 @@ def infer_flow_cdf_probs(
     drop_idx: Optional[torch.Tensor],
     device: torch.device,
     batch: int,
+    flow_x_idx=None,
+    flow_c_idx=None,
 ) -> np.ndarray:
     n = x_ctx_raw.shape[0]
     out = np.empty((n,), dtype=np.float32)
@@ -463,7 +554,8 @@ def infer_flow_cdf_probs(
         xe = (xe_raw - expert_mean) / (expert_std + 1e-6)
 
         yb = y_thr_std[i0:i1]
-        cdf = flow.cdf(yb, xe).reshape(-1)  # P(Y <= y_thr | x)
+        cond = _make_flow_cond(xe, flow, flow_x_idx=flow_x_idx, flow_c_idx=flow_c_idx)
+        cdf = flow.cdf(yb, cond).reshape(-1)  # P(Y <= y_thr | x)
         out[i0:i1] = cdf.float().detach().cpu().numpy()
     return out
 
@@ -481,6 +573,8 @@ def eval_flow_nll_and_pit(
     drop_idx: Optional[torch.Tensor],
     device: torch.device,
     batch: int,
+    flow_x_idx=None,
+    flow_c_idx=None,
 ) -> Tuple[float, float, float]:
     """
     Match training loss logic:
@@ -525,16 +619,18 @@ def eval_flow_nll_and_pit(
         # uncensored: -log_prob
         mask_u = ~is_c
         if mask_u.any():
-            loss_val[mask_u] = -flow.log_prob(yb[mask_u], xb[mask_u])
+            cond_u = _make_flow_cond(xb[mask_u], flow, flow_x_idx=flow_x_idx, flow_c_idx=flow_c_idx)
+            loss_val[mask_u] = -flow.log_prob(yb[mask_u], cond_u)
 
             # PIT on uncensored
-            pit = flow.cdf(yb[mask_u], xb[mask_u])
+            pit = flow.cdf(yb[mask_u], cond_u)
             pits.append(pit.detach().cpu())
 
         # censored: -log(survival)
         mask_c = is_c
         if mask_c.any():
-            u, _ = flow.y_to_u(yb[mask_c], xb[mask_c])
+            cond_c = _make_flow_cond(xb[mask_c], flow, flow_x_idx=flow_x_idx, flow_c_idx=flow_c_idx)
+            u, _ = flow.y_to_u(yb[mask_c], cond_c)
             surv = 0.5 * torch.erfc(u / 1.41421356237)
             surv = torch.clamp(surv, min=1e-6)
             loss_val[mask_c] = -torch.log(surv)
@@ -563,6 +659,11 @@ def main():
     ap.add_argument("--split", default="val", choices=["train", "val", "test"], help="Which split to evaluate.")
     ap.add_argument("--ttc_floor", type=float, default=0.05)
     ap.add_argument("--ttc_cap", type=float, default=8.0)
+
+    ap.add_argument("--x_to_c_regex", type=str, default="",
+                    help="Comma-separated regex. Matching x__* columns will be renamed to c__* before preprocessing.")
+    ap.add_argument("--expert_drop_feature_regex", type=str, default="",
+                    help="Comma-separated regex. Matching expert feature columns will be hard-dropped (set to train-mean) for flow, in eval.")
 
     # event label definition
     ap.add_argument("--label_mode", default="ttc_sstar", choices=["ttc_sstar", "ttc_fixed", "gate_clean"])
@@ -634,6 +735,15 @@ def main():
 
         # expert fingerprint suppression indices
         drop_idx = sorted(set(getattr(state, "drop_context_idx_expert", []) or []))
+        # extra hard-drop by regex (optional)
+        extra_drop_patterns = _parse_csv_list(args.expert_drop_feature_regex)
+        if extra_drop_patterns:
+            expert_colnames = ds.get_x_expert_colnames()
+            extra_cols = _match_cols_by_regex(expert_colnames, extra_drop_patterns)
+            if extra_cols:
+                extra_idx = [expert_colnames.index(c) for c in extra_cols]
+                print(f"[expert_drop_feature_regex] hard-drop {len(extra_idx)} expert cols. Example: {extra_cols[:10]}")
+                drop_idx = sorted(set(drop_idx + extra_idx))
         drop_idx_t = torch.tensor(drop_idx, dtype=torch.long) if len(drop_idx) else None
 
         # load models
@@ -693,6 +803,8 @@ def main():
                 drop_idx=drop_idx_t,
                 device=device,
                 batch=args.batch,
+                flow_x_idx=getattr(state, 'flow_x_idx', None),
+                flow_c_idx=getattr(state, 'flow_c_idx', None),
             )
 
             # expert nll + PIT on expert training subset
@@ -707,6 +819,8 @@ def main():
                 drop_idx=drop_idx_t,
                 device=device,
                 batch=args.batch,
+                flow_x_idx=getattr(state, 'flow_x_idx', None),
+                flow_c_idx=getattr(state, 'flow_c_idx', None),
             )
         else:
             # gaussian expert path (optional if your codebase has it)
@@ -876,4 +990,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
