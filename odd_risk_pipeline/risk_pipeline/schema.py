@@ -83,7 +83,17 @@ class FeatureSchema:
 
     @staticmethod
     def from_json(s: str) -> "FeatureSchema":
-        return FeatureSchema(**json.loads(s))
+        # Backward/forward compatible: ignore unknown keys if schema format evolves.
+        d = json.loads(s)
+        if not isinstance(d, dict):
+            raise TypeError("FeatureSchema JSON must decode to a dict.")
+        try:
+            from dataclasses import fields
+            allowed = {f.name for f in fields(FeatureSchema)}
+            d = {k: v for k, v in d.items() if k in allowed}
+        except Exception:
+            pass
+        return FeatureSchema(**d)
 
 
 def _match_regex(cols: Sequence[str], pattern: str) -> List[str]:
