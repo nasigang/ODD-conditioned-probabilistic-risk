@@ -18,6 +18,89 @@ import numpy as np
 import pandas as pd
 import torch
 
+
+def _flow_expects_tuple(flow) -> bool:
+    fn = getattr(flow, "expects_tuple_condition", None)
+    if callable(fn):
+        return bool(fn())
+    return bool((flow.expects_tuple_condition() if callable(getattr(flow, 'expects_tuple_condition', None)) else bool(getattr(flow, 'expects_tuple_condition', False))))
+
+def _make_flow_cond(x_expert_std: torch.Tensor, flow: torch.nn.Module, flow_x_idx=None, flow_c_idx=None):
+    # Prepare conditioning for both concat and FiLM Flow.
+    if _flow_expects_tuple(flow):
+        if flow_x_idx is None or flow_c_idx is None or len(flow_x_idx) == 0 or len(flow_c_idx) == 0:
+            raise RuntimeError("FiLM Flow requires non-empty flow_x_idx and flow_c_idx (check preprocess_state.json and --flow_feature_split).")
+        return (x_expert_std[:, flow_x_idx], x_expert_std[:, flow_c_idx])
+    return x_expert_std
+import re
+from typing import Dict, List, Tuple, Iterable
+
+def _parse_csv_list(s: str) -> List[str]:
+    if not s:
+        return []
+    return [x.strip() for x in s.split(',') if x.strip()]
+
+def _build_x_to_c_rename_map(columns: Iterable[str], patterns: List[str]) -> Dict[str, str]:
+    """Rename x__* columns to c__* if any regex pattern matches the column name."""
+    if not patterns:
+        return {}
+    regs = [re.compile(p) for p in patterns]
+    cols = list(columns)
+    colset = set(cols)
+    rename: Dict[str, str] = {}
+    for col in cols:
+        if not col.startswith('x__'):
+            continue
+        if any(r.search(col) for r in regs):
+            new = 'c__' + col[len('x__'):]
+            if new in colset and new != col:
+                raise ValueError(f"[x_to_c] rename collision: {col} -> {new} already exists in dataframe.")
+            rename[col] = new
+    return rename
+
+def _apply_rename(df: 'pd.DataFrame', rename: Dict[str, str]) -> 'pd.DataFrame':
+    return df.rename(columns=rename) if rename else df
+
+def _schema_expected_columns(schema) -> List[str]:
+    expected = set()
+    for attr in dir(schema):
+        if 'cols' not in attr:
+            continue
+        try:
+            v = getattr(schema, attr)
+        except Exception:
+            continue
+        if isinstance(v, (list, tuple)) and v and all(isinstance(x, str) for x in v):
+            expected.update(v)
+    return sorted(expected)
+
+def _auto_align_xc_prefix_swap(df: 'pd.DataFrame', schema) -> Tuple['pd.DataFrame', Dict[str, str]]:
+    """If schema expects c__foo but df has x__foo (or vice versa), rename automatically."""
+    expected = _schema_expected_columns(schema)
+    cols = set(df.columns)
+    rename: Dict[str, str] = {}
+    for exp in expected:
+        if exp in cols:
+            continue
+        if exp.startswith('c__'):
+            alt = 'x__' + exp[len('c__'):]
+        elif exp.startswith('x__'):
+            alt = 'c__' + exp[len('x__'):]
+        else:
+            continue
+        if alt in cols and exp not in cols:
+            rename[alt] = exp
+    if rename:
+        df = df.rename(columns=rename)
+    return df, rename
+
+def _match_cols_by_regex(colnames: List[str], patterns: List[str]) -> List[str]:
+    if not patterns:
+        return []
+    regs = [re.compile(p) for p in patterns]
+    return [c for c in colnames if any(r.search(c) for r in regs)]
+
+
 # sklearn optional
 try:
     from sklearn.metrics import roc_auc_score, average_precision_score
@@ -359,7 +442,7 @@ def infer_flow_cdf_probs(
 
         xe = (xe_raw - expert_mean) / (expert_std + 1e-6)
         yb = y_thr_std[i0:i1]
-        cdf = flow.cdf(yb, xe).reshape(-1)
+        cdf = flow.cdf(yb, xe_cond).reshape(-1)
         out[i0:i1] = cdf.float().detach().cpu().numpy()
     return out
 
@@ -570,7 +653,7 @@ def flow_tail_diagnostics(
         xe = (xe_raw - expert_mean_d) / (expert_std_d + 1e-6)
         yb = y_std_d[i0:i1][m]
         xb = xe[m]
-        pit = flow.cdf(yb, xb).reshape(-1)
+        pit = flow.cdf(yb, xb_cond).reshape(-1)
         pits.append(pit.detach().cpu().numpy())
 
     pit_all = np.concatenate(pits, axis=0) if pits else np.zeros((0,), dtype=np.float32)
@@ -687,6 +770,11 @@ def main():
     ap.add_argument("--ttc_floor", type=float, default=0.05)
     ap.add_argument("--ttc_cap", type=float, default=8.0)
 
+    ap.add_argument("--x_to_c_regex", type=str, default="",
+                    help="Comma-separated regex. Matching x__* columns will be renamed to c__* before preprocessing.")
+    ap.add_argument("--expert_drop_feature_regex", type=str, default="",
+                    help="Comma-separated regex. Matching expert feature columns will be hard-dropped (set to train-mean) for flow, in diagnostics.")
+
     ap.add_argument("--label_mode", default="ttc_sstar", choices=["ttc_sstar", "ttc_fixed", "gate_clean"])
     ap.add_argument("--sstar_mode", default="closing_speed", choices=["closing_speed", "ego_speed"])
     ap.add_argument("--tau", type=float, default=0.5)
@@ -770,6 +858,14 @@ def main():
         expert_mean, expert_std = scale["expert_mean"], scale["expert_std"]
 
         drop_idx = sorted(set(getattr(state, "drop_context_idx_expert", []) or []))
+        extra_drop_patterns = _parse_csv_list(args.expert_drop_feature_regex)
+        if extra_drop_patterns:
+            expert_colnames = ds.get_x_expert_colnames()
+            extra_cols = _match_cols_by_regex(expert_colnames, extra_drop_patterns)
+            if extra_cols:
+                extra_idx = [expert_colnames.index(c) for c in extra_cols]
+                print(f"[expert_drop_feature_regex] hard-drop {len(extra_idx)} expert cols. Example: {extra_cols[:10]}")
+                drop_idx = sorted(set(drop_idx + extra_idx))
         drop_idx_t = torch.tensor(drop_idx, dtype=torch.long) if len(drop_idx) else None
 
         gate, expert, expert_type = load_models_for_run(run_dir, state, device=device)
@@ -1005,4 +1101,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
