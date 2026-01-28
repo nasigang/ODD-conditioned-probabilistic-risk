@@ -1,0 +1,57 @@
+{
+  "run": "/workspace/out/waymo_wod_parquet/runs/run_flow_film_p1",
+  "run_name": "run_flow_film_p1",
+  "split": "val",
+  "N": 23553,
+  "pos_rate": 0.05532203965524562,
+  "gate_pr_auc": 0.43474332521627795,
+  "gate_roc_auc": 0.8265856917802592,
+  "gate_brier": 0.1244699240639892,
+  "gate_ece": 0.05978455612315257,
+  "risk_label_mode": "ttc_sstar",
+  "risk_pr_auc": 0.09980843628388811,
+  "risk_roc_auc": 0.6971592780704856,
+  "risk_brier": 0.061412479358502435,
+  "risk_ece": 0.07137088689890386,
+  "expert_type": "flow",
+  "expert_nll": 2.269322395324707,
+  "pit_mean": 0.667840301990509,
+  "pit_std": 0.3177264332771301,
+  "risk_mean": 0.12344926595687866,
+  "risk_p95": 0.32161113619804366,
+  "p_gate_mean": 0.21746282279491425,
+  "p_event_mean": 0.4982684552669525,
+  "subgroup": {},
+  "ttc_bin_diag": [
+    {
+      "bin": 0,
+      "N": 3926,
+      "logttc_lo": -2.3025851829940396,
+      "logttc_hi": 1.9393658292642955,
+      "event_rate": 0.33188996434029544,
+      "risk_mean": 0.20618341863155365,
+      "p_gate_mean": 0.3437344431877136,
+      "p_event_mean": 0.6107578873634338
+    },
+    {
+      "bin": 1,
+      "N": 418,
+      "logttc_lo": 1.9393658292642955,
+      "logttc_hi": 2.3025850930940455,
+      "event_rate": 0.0,
+      "risk_mean": 0.20076458156108856,
+      "p_gate_mean": 0.3267606496810913,
+      "p_event_mean": 0.6217556595802307
+    },
+    {
+      "bin": 5,
+      "N": 19209,
+      "logttc_lo": 2.3025850930940455,
+      "logttc_hi": 2.3025850930940455,
+      "event_rate": 0.0,
+      "risk_mean": 0.10485736280679703,
+      "p_gate_mean": 0.18927660584449768,
+      "p_event_mean": 0.4725903570652008
+    }
+  ]
+}

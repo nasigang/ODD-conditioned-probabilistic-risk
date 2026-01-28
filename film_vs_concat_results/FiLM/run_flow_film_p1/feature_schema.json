@@ -1,0 +1,79 @@
+{
+  "x_gate_cont": [
+    "x__dist_to_intersection_lane_m",
+    "x__dyn_label_count_30m",
+    "x__ego_accel_lag1",
+    "x__ego_accel_lag2",
+    "x__ego_accel_mps2",
+    "x__ego_jerk_mps3",
+    "x__ego_speed_lag1",
+    "x__ego_speed_lag2",
+    "x__ego_speed_mps",
+    "x__ego_yaw_rate_rps",
+    "x__mean_lidar_points_in_box_dyn_30m",
+    "x__occlusion_low_points_ratio_dyn_30m"
+  ],
+  "x_gate_bin": [
+    "c__has_crosswalk",
+    "c__has_driveway",
+    "c__has_speed_bump",
+    "c__has_stop_sign",
+    "x__is_near_crosswalk",
+    "x__is_near_driveway",
+    "x__is_near_intersection",
+    "x__is_near_speed_bump",
+    "x__is_near_stop_sign"
+  ],
+  "x_gate_onehot": [
+    "c__infra_density_bin=high",
+    "c__infra_density_bin=low",
+    "c__infra_density_bin=mid",
+    "c__occlusion_bin=high",
+    "c__occlusion_bin=low",
+    "c__occlusion_bin=mid",
+    "c__odd_category=intersection",
+    "c__odd_category=merge",
+    "c__odd_category=split",
+    "c__odd_category=straight",
+    "c__odd_time=Dawn/Dusk",
+    "c__odd_time=Day",
+    "c__odd_time=Night",
+    "c__odd_weather=Rain",
+    "c__odd_weather=Sunny",
+    "c__speed_bin=high",
+    "c__speed_bin=low",
+    "c__speed_bin=mid",
+    "c__traffic_density_bin=high",
+    "c__traffic_density_bin=low",
+    "c__traffic_density_bin=mid"
+  ],
+  "x_expert_extra_cont": [
+    "n_edges",
+    "n_flagged",
+    "x__appr_cnt_any",
+    "x__appr_cnt_front",
+    "x__appr_cnt_left",
+    "x__appr_cnt_rear",
+    "x__appr_cnt_right",
+    "x__density",
+    "x__max_closing_speed_any_mps",
+    "x__max_closing_speed_front_mps",
+    "x__max_closing_speed_left_mps",
+    "x__max_closing_speed_rear_mps",
+    "x__max_closing_speed_right_mps",
+    "x__min_range_any_m",
+    "x__min_range_front_m",
+    "x__min_range_left_m",
+    "x__min_range_rear_m",
+    "x__min_range_right_m"
+  ],
+  "id_cols": [
+    "segment_id",
+    "frame_label"
+  ],
+  "target_cols": [
+    "y_soft"
+  ],
+  "flow_x_cols": null,
+  "flow_c_cols": null
+}
