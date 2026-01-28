@@ -1,0 +1,19 @@
+{
+  "run_name": "run_flow_film_p1",
+  "split": "val",
+  "tau": 1.0,
+  "amax": 6.0,
+  "N": 23553,
+  "pos_rate": 0.06572411157814291,
+  "risk_pr_auc": 0.24717057899229175,
+  "risk_roc_auc": 0.8651528281979624,
+  "risk_brier": 0.05409905030880589,
+  "risk_ece": 0.014353007862612175,
+  "p_gate_mean": 0.21746282279491425,
+  "p_event_mean": 0.23396997153759003,
+  "gate_thr_for_target_recall": 0.2,
+  "p_event_calib_ece": 0.16824586228322602,
+  "p_event_calib_brier": 0.1329189090982369,
+  "pit_ks_u_uniform": 0.8349254871990829,
+  "pit_ks_n": 23553
+}
