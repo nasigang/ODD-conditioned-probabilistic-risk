@@ -1,0 +1,19 @@
+{
+  "run_name": "run_flow_concat_p1",
+  "split": "val",
+  "tau": 0.1,
+  "amax": 6.0,
+  "N": 23553,
+  "pos_rate": 0.047297584171867704,
+  "risk_pr_auc": 0.25126618003257783,
+  "risk_roc_auc": 0.89697842697094,
+  "risk_brier": 0.03893698343055435,
+  "risk_ece": 0.00651268753384941,
+  "p_gate_mean": 0.22196407616138458,
+  "p_event_mean": 0.17788343131542206,
+  "gate_thr_for_target_recall": 0.2,
+  "p_event_calib_ece": 0.1305858383045902,
+  "p_event_calib_brier": 0.10815417050298977,
+  "pit_ks_u_uniform": 0.8337366789793232,
+  "pit_ks_n": 23553
+}
