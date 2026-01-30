@@ -1,365 +1,246 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Diagnostics for:
-  1) Tau sweep (threshold sensitivity / calibration)
-  2) Gate recall bottleneck w.r.t. y_event
-  3) Flow tail diagnostics (PIT hist + conditional TTC PDF low vs high)
+# ============================================================
+# diagnose_tau_gate_flow_antigravity_final5.py
+#
+# VERSION: antigravity_final5
+#
+# Fixes your recurring error in _plot_ttc_pdf_low_vs_high():
+#   RuntimeError: Size does not match at dimension 0 expected index [240, 1] ...
+#
+# Root cause:
+#   When plotting PDF, y_std is a grid (G=240) but cond_low/cond_high is a single
+#   condition (batch=1). Flow expects y and cond to have matching batch size.
+#
+# This file:
+#   - repeats cond to match grid batch size BEFORE calling flow.log_prob
+#   - adds --skip_flow_pdf (if you want to bypass the plot entirely)
+#   - prints version banner so you can verify the correct file is running
+# ============================================================
 
-Built by reusing the logic/implementations from eval_risk_models_v6.5.py (v6.5).
-"""
+from __future__ import annotations
 
-import argparse
+import os
 import json
+import argparse
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, Tuple, Optional, List
 
 import numpy as np
 import pandas as pd
 import torch
+import matplotlib.pyplot as plt
+
+from risk_pipeline.preprocess import load_preprocess_state, transform_dataframe
+from risk_pipeline.data import RiskCSVDataset
+from risk_pipeline.models import GateMLP, ConditionalSpline1DFlow
+from risk_pipeline.train import _make_flow_cond
+from risk_pipeline.risk import RiskConfig, compute_risk
 
 
-def _flow_expects_tuple(flow) -> bool:
-    fn = getattr(flow, "expects_tuple_condition", None)
-    if callable(fn):
-        return bool(fn())
-    return bool((flow.expects_tuple_condition() if callable(getattr(flow, 'expects_tuple_condition', None)) else bool(getattr(flow, 'expects_tuple_condition', False))))
+def safe_torch_load(path: str, map_location="cpu"):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
 
-def _make_flow_cond(x_expert_std: torch.Tensor, flow: torch.nn.Module, flow_x_idx=None, flow_c_idx=None):
-    # Prepare conditioning for both concat and FiLM Flow.
-    if _flow_expects_tuple(flow):
-        if flow_x_idx is None or flow_c_idx is None or len(flow_x_idx) == 0 or len(flow_c_idx) == 0:
-            raise RuntimeError("FiLM Flow requires non-empty flow_x_idx and flow_c_idx (check preprocess_state.json and --flow_feature_split).")
-        return (x_expert_std[:, flow_x_idx], x_expert_std[:, flow_c_idx])
-    return x_expert_std
-import re
-from typing import Dict, List, Tuple, Iterable
 
-def _parse_csv_list(s: str) -> List[str]:
-    if not s:
-        return []
-    return [x.strip() for x in s.split(',') if x.strip()]
+# -------------------------
+# Metrics (no sklearn dependency)
+# -------------------------
 
-def _build_x_to_c_rename_map(columns: Iterable[str], patterns: List[str]) -> Dict[str, str]:
-    """Rename x__* columns to c__* if any regex pattern matches the column name."""
-    if not patterns:
-        return {}
-    regs = [re.compile(p) for p in patterns]
-    cols = list(columns)
-    colset = set(cols)
-    rename: Dict[str, str] = {}
-    for col in cols:
-        if not col.startswith('x__'):
-            continue
-        if any(r.search(col) for r in regs):
-            new = 'c__' + col[len('x__'):]
-            if new in colset and new != col:
-                raise ValueError(f"[x_to_c] rename collision: {col} -> {new} already exists in dataframe.")
-            rename[col] = new
-    return rename
+def pr_auc_average_precision(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    y_true = y_true.astype(np.int64)
+    y_score = y_score.astype(np.float64)
+    if y_true.size == 0 or np.unique(y_true).size < 2:
+        return float("nan")
 
-def _apply_rename(df: 'pd.DataFrame', rename: Dict[str, str]) -> 'pd.DataFrame':
-    return df.rename(columns=rename) if rename else df
+    order = np.argsort(-y_score)
+    y = y_true[order]
+    P = float(np.sum(y == 1))
+    if P <= 0:
+        return float("nan")
 
-def _schema_expected_columns(schema) -> List[str]:
-    expected = set()
-    for attr in dir(schema):
-        if 'cols' not in attr:
-            continue
-        try:
-            v = getattr(schema, attr)
-        except Exception:
-            continue
-        if isinstance(v, (list, tuple)) and v and all(isinstance(x, str) for x in v):
-            expected.update(v)
-    return sorted(expected)
+    tp = 0.0
+    fp = 0.0
+    ap = 0.0
+    prev_recall = 0.0
 
-def _auto_align_xc_prefix_swap(df: 'pd.DataFrame', schema) -> Tuple['pd.DataFrame', Dict[str, str]]:
-    """If schema expects c__foo but df has x__foo (or vice versa), rename automatically."""
-    expected = _schema_expected_columns(schema)
-    cols = set(df.columns)
-    rename: Dict[str, str] = {}
-    for exp in expected:
-        if exp in cols:
-            continue
-        if exp.startswith('c__'):
-            alt = 'x__' + exp[len('c__'):]
-        elif exp.startswith('x__'):
-            alt = 'c__' + exp[len('x__'):]
+    for i in range(len(y)):
+        if y[i] == 1:
+            tp += 1.0
         else:
-            continue
-        if alt in cols and exp not in cols:
-            rename[alt] = exp
-    if rename:
-        df = df.rename(columns=rename)
-    return df, rename
-
-def _match_cols_by_regex(colnames: List[str], patterns: List[str]) -> List[str]:
-    if not patterns:
-        return []
-    regs = [re.compile(p) for p in patterns]
-    return [c for c in colnames if any(r.search(c) for r in regs)]
+            fp += 1.0
+        recall = tp / P
+        precision = tp / max(1.0, tp + fp)
+        if y[i] == 1:
+            ap += (recall - prev_recall) * precision
+            prev_recall = recall
+    return float(ap)
 
 
-# sklearn optional
-try:
-    from sklearn.metrics import roc_auc_score, average_precision_score
-except Exception:
-    roc_auc_score = None
-    average_precision_score = None
-
-
-# ----------------------------
-# Metrics
-# ----------------------------
-def _safe_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
-    if roc_auc_score is None:
+def roc_auc_trapezoid(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    y_true = y_true.astype(np.int64)
+    y_score = y_score.astype(np.float64)
+    if y_true.size == 0 or np.unique(y_true).size < 2:
         return float("nan")
-    if len(np.unique(y_true)) < 2:
+
+    order = np.argsort(-y_score)
+    y = y_true[order]
+    P = float(np.sum(y == 1))
+    N = float(np.sum(y == 0))
+    if P <= 0 or N <= 0:
         return float("nan")
-    return float(roc_auc_score(y_true, y_score))
 
+    tps = 0.0
+    fps = 0.0
+    fpr = [0.0]
+    tpr = [0.0]
 
-def _safe_prauc(y_true: np.ndarray, y_score: np.ndarray) -> float:
-    if average_precision_score is None:
-        return float("nan")
-    if len(np.unique(y_true)) < 2:
-        return float("nan")
-    return float(average_precision_score(y_true, y_score))
+    for i in range(len(y)):
+        if y[i] == 1:
+            tps += 1.0
+        else:
+            fps += 1.0
+        fpr.append(fps / N)
+        tpr.append(tps / P)
 
-
-def brier(y_true: np.ndarray, y_prob: np.ndarray) -> float:
-    y_true = y_true.astype(np.float64)
-    y_prob = np.clip(y_prob.astype(np.float64), 1e-7, 1 - 1e-7)
-    return float(np.mean((y_prob - y_true) ** 2))
+    auc = 0.0
+    for i in range(1, len(fpr)):
+        auc += (fpr[i] - fpr[i - 1]) * (tpr[i] + tpr[i - 1]) * 0.5
+    return float(auc)
 
 
 def ece(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 15) -> float:
     y_true = y_true.astype(np.float64)
-    y_prob = np.clip(y_prob.astype(np.float64), 1e-7, 1 - 1e-7)
+    y_prob = np.clip(y_prob.astype(np.float64), 0.0, 1.0)
+    if y_true.size == 0:
+        return float("nan")
     bins = np.linspace(0.0, 1.0, n_bins + 1)
-    ece_val = 0.0
-    N = len(y_true)
+    out = 0.0
     for i in range(n_bins):
         lo, hi = bins[i], bins[i + 1]
-        m = (y_prob >= lo) & (y_prob < hi if i < n_bins - 1 else y_prob <= hi)
+        m = (y_prob >= lo) & (y_prob < hi) if i < n_bins - 1 else (y_prob >= lo) & (y_prob <= hi)
         if not np.any(m):
             continue
         acc = float(np.mean(y_true[m]))
         conf = float(np.mean(y_prob[m]))
-        ece_val += (float(np.sum(m)) / float(N)) * abs(acc - conf)
-    return float(ece_val)
+        out += float(np.mean(m)) * abs(acc - conf)
+    return float(out)
 
 
-# ----------------------------
-# Labels / thresholds (same as eval_risk_models_v6.5.py)
-# ----------------------------
-def compute_ttc(df: pd.DataFrame, eps: float = 1e-6) -> np.ndarray:
-    if "min_ttc_est" in df.columns:
-        ttc_raw = pd.to_numeric(df["min_ttc_est"], errors="coerce").to_numpy(np.float64)
-        ttc_raw = np.where(np.isfinite(ttc_raw) & (ttc_raw > 0.0), ttc_raw, np.inf)
-        return ttc_raw
-    y_soft = pd.to_numeric(df["y_soft"], errors="coerce").to_numpy(np.float64)
-    valid = np.isfinite(y_soft) & (y_soft > 0.0)
-    ttc = np.where(valid, 1.0 / (y_soft + eps), np.inf)
-    return ttc
+# -------------------------
+# Helpers
+# -------------------------
+
+def _ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
 
 
-def s_star(v: np.ndarray, tau: float, amax: float, cap: float) -> np.ndarray:
-    v = np.asarray(v, dtype=np.float64)
-    s = tau + np.maximum(v, 0.0) / max(amax, 1e-6)
-    return np.clip(s, 0.0, cap)
-
-
-def build_event_label(
-    df: pd.DataFrame,
-    *,
-    ttc_floor: float,
-    ttc_cap: float,
-    label_mode: str,
-    sstar_mode: str,
-    tau: float,
-    amax: float,
-    fixed_ttc: float = 2.0,
-    require_edges: bool = True,
-    y_gate_proxy: Optional[np.ndarray] = None,
-) -> np.ndarray:
-    ttc = compute_ttc(df, eps=1e-6)
-    ttc = np.clip(ttc, ttc_floor, ttc_cap)
-
-    if label_mode == "gate_clean":
-        if y_gate_proxy is None:
-            y_gate_proxy = (
-                pd.to_numeric(df.get("n_edges", 0), errors="coerce")
-                .fillna(0.0)
-                .to_numpy() > 0.0
-            ).astype(np.int64)
-        return (y_gate_proxy > 0).astype(np.int64)
-
-    if label_mode == "ttc_fixed":
-        y = (ttc <= float(fixed_ttc)).astype(np.int64)
-    elif label_mode == "ttc_sstar":
-        if sstar_mode == "ego_speed":
-            v = pd.to_numeric(df.get("x__ego_speed_mps", 0.0), errors="coerce").fillna(0.0).to_numpy(np.float64)
-        else:
-            if "x__max_closing_speed_any_mps" in df.columns:
-                v = pd.to_numeric(df["x__max_closing_speed_any_mps"], errors="coerce").fillna(0.0).to_numpy(np.float64)
-            elif "x__closing_speed_mps_max" in df.columns:
-                v = pd.to_numeric(df["x__closing_speed_mps_max"], errors="coerce").fillna(0.0).to_numpy(np.float64)
-            else:
-                v = pd.to_numeric(df.get("x__ego_speed_mps", 0.0), errors="coerce").fillna(0.0).to_numpy(np.float64)
-
-        thr = s_star(v, tau=float(tau), amax=float(amax), cap=float(ttc_cap))
-        y = (ttc <= thr).astype(np.int64)
-    else:
-        raise ValueError(f"Unknown label_mode={label_mode}")
-
-    if require_edges and y_gate_proxy is not None:
-        y = (y.astype(bool) & (y_gate_proxy > 0)).astype(np.int64)
-    return y
-
-
-def build_event_threshold_ttc(
-    df: pd.DataFrame,
-    *,
-    ttc_cap: float,
-    label_mode: str,
-    sstar_mode: str,
-    tau: float,
-    amax: float,
-    fixed_ttc: float,
-) -> np.ndarray:
-    if label_mode == "ttc_fixed":
-        return np.full((len(df),), float(fixed_ttc), dtype=np.float64)
-    if label_mode == "gate_clean":
-        return np.full((len(df),), float(ttc_cap), dtype=np.float64)
-    if label_mode != "ttc_sstar":
-        raise ValueError(label_mode)
-
-    if sstar_mode == "ego_speed":
-        v = pd.to_numeric(df.get("x__ego_speed_mps", 0.0), errors="coerce").fillna(0.0).to_numpy(np.float64)
-    else:
-        if "x__max_closing_speed_any_mps" in df.columns:
-            v = pd.to_numeric(df["x__max_closing_speed_any_mps"], errors="coerce").fillna(0.0).to_numpy(np.float64)
-        elif "x__closing_speed_mps_max" in df.columns:
-            v = pd.to_numeric(df["x__closing_speed_mps_max"], errors="coerce").fillna(0.0).to_numpy(np.float64)
-        else:
-            v = pd.to_numeric(df.get("x__ego_speed_mps", 0.0), errors="coerce").fillna(0.0).to_numpy(np.float64)
-
-    return s_star(v, tau=float(tau), amax=float(amax), cap=float(ttc_cap))
-
-
-# ----------------------------
-# Run artifacts (same as eval_risk_models_v6.5.py)
-# ----------------------------
-def load_json(p: Path) -> dict:
-    with p.open("r", encoding="utf-8") as f:
+def _load_split_map(run_dir: str) -> Optional[Dict]:
+    p = os.path.join(run_dir, "segment_split.json")
+    if not os.path.exists(p):
+        return None
+    with open(p, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def _as_id_list(v: Any) -> Optional[List[str]]:
-    if isinstance(v, (list, tuple, set)):
-        return [str(x) for x in v]
-    if isinstance(v, dict):
-        for kk in ("segment_ids", "segments", "ids"):
-            vv = v.get(kk, None)
-            if isinstance(vv, (list, tuple, set)):
-                return [str(x) for x in vv]
-    return None
-
-
-def load_segment_split(run_dir: Path) -> Dict[str, List[str]]:
-    p = run_dir / "segment_split.json"
-    if not p.exists():
-        raise FileNotFoundError(f"Missing {p}")
-    d = load_json(p)
-    out: Dict[str, List[str]] = {}
-    for k in ("train", "val", "test"):
-        if k in d:
-            ids = _as_id_list(d[k])
-            if ids is not None:
-                out[k] = ids
-    if not out and any((k.endswith("_segments") for k in d.keys())):
-        for k in ("train", "val", "test"):
-            kk = f"{k}_segments"
-            if kk in d:
-                ids = _as_id_list(d[kk])
-                if ids is not None:
-                    out[k] = ids
-    if not out:
-        raise TypeError(f"{p} has no usable split lists. Keys={list(d.keys())[:20]}")
-    return out
-
-
-def pick_split_df(df: pd.DataFrame, segs: List[str]) -> pd.DataFrame:
-    segset = set(map(str, segs))
-    return df[df["segment_id"].astype(str).isin(segset)].copy()
-
-
-def _strip_module_prefix(sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    if not any(k.startswith("module.") for k in sd.keys()):
-        return sd
-    return {k[len("module.") :]: v for k, v in sd.items()}
-
-
-def _torch_load_sd(path: Path, device: torch.device) -> Dict[str, torch.Tensor]:
-    try:
-        obj = torch.load(path, map_location=device, weights_only=True)
-    except TypeError:
-        obj = torch.load(path, map_location=device)
-
-    if isinstance(obj, dict) and "state_dict" in obj and isinstance(obj["state_dict"], dict):
-        obj = obj["state_dict"]
-    if not isinstance(obj, dict):
-        raise TypeError(f"{path} is not a state_dict (type={type(obj)})")
-    obj = _strip_module_prefix(obj)
-    return obj
+def _filter_df_by_split(df: pd.DataFrame, split_map: Optional[Dict], split: str) -> pd.DataFrame:
+    if split_map is None or split == "all":
+        return df
+    segs = set(map(str, split_map.get(split, [])))
+    if not segs or "segment_id" not in df.columns:
+        return df
+    return df[df["segment_id"].astype(str).isin(segs)].copy()
 
 
 def _infer_mlp_dims_from_sd(sd: Dict[str, torch.Tensor]) -> Tuple[int, int, int]:
-    w2 = [(k, v) for k, v in sd.items() if k.endswith("weight") and getattr(v, "ndim", 0) == 2]
-    if not w2:
-        raise RuntimeError("Could not infer MLP dims: no 2D weights found.")
-    first_w = w2[0][1]
-    hidden = int(first_w.shape[0])
-    in_dim = int(first_w.shape[1])
-    n_linear = len(w2)
-    depth = max(1, n_linear - 1)
+    w0 = None
+    for k, v in sd.items():
+        if k.endswith("net.0.weight"):
+            w0 = v
+            break
+    if w0 is None:
+        cand = [(k, v) for k, v in sd.items() if k.startswith("net.") and k.endswith(".weight")]
+        if not cand:
+            raise RuntimeError("Could not infer GateMLP dims: no net.*.weight keys.")
+        cand.sort(key=lambda kv: int(kv[0].split(".")[1]))
+        w0 = cand[0][1]
+
+    hidden = int(w0.shape[0])
+    in_dim = int(w0.shape[1])
+
+    idxs = []
+    for k in sd.keys():
+        if k.startswith("net.") and k.endswith(".weight"):
+            try:
+                idxs.append(int(k.split(".")[1]))
+            except Exception:
+                pass
+    num_linears = len(set(idxs))
+    depth = max(1, num_linears - 1)
     return in_dim, hidden, depth
 
 
-def _infer_flow_hparams_from_sd(flow_sd: Dict[str, torch.Tensor]) -> Tuple[int, int, int]:
-    lin_keys = [k for k, v in flow_sd.items() if k.startswith("net.") and k.endswith(".weight") and getattr(v, "ndim", 0) == 2]
-    if not lin_keys:
-        raise RuntimeError("Could not find flow linear weights under net.*.weight")
+def _infer_flow_arch_and_hparams_from_sd(sd: Dict[str, torch.Tensor]) -> Tuple[str, int, int, int, int, int]:
+    # concat
+    if any(k.startswith("net.") for k in sd.keys()):
+        cand = [(k, v) for k, v in sd.items() if k.startswith("net.") and k.endswith(".weight")]
+        if not cand:
+            raise RuntimeError("Could not infer Flow (concat): no net.*.weight keys.")
+        cand.sort(key=lambda kv: int(kv[0].split(".")[1]))
 
-    def _net_idx(k: str) -> int:
-        try:
-            return int(k.split(".")[1])
-        except Exception:
-            return -1
+        w0 = cand[0][1]
+        hidden = int(w0.shape[0])
+        cond_dim = int(w0.shape[1])
 
-    lin_keys_sorted = sorted(lin_keys, key=_net_idx)
-    first_w = flow_sd[lin_keys_sorted[0]]
-    last_w = flow_sd[lin_keys_sorted[-1]]
-    hidden = int(first_w.shape[0])
-    out_dim = int(last_w.shape[0])
+        last_w = cand[-1][1]
+        out_dim = int(last_w.shape[0])
+        if (out_dim - 1) % 3 != 0:
+            raise RuntimeError(f"Could not infer num_bins from out_dim={out_dim} (expected 3*K+1).")
+        num_bins = int((out_dim - 1) // 3)
+
+        idxs = []
+        for k, _ in cand:
+            try:
+                idxs.append(int(k.split(".")[1]))
+            except Exception:
+                pass
+        depth = max(1, len(set(idxs)) - 1)
+        return "concat", hidden, depth, num_bins, cond_dim, 0
+
+    # film
+    if "trunk.0.weight" not in sd or "film.0.weight" not in sd or "head.weight" not in sd:
+        raise RuntimeError("Could not infer Flow (film): expected trunk.0.weight, film.0.weight, head.weight in state_dict.")
+
+    trunk0 = sd["trunk.0.weight"]
+    film0 = sd["film.0.weight"]
+    head = sd["head.weight"]
+
+    hidden = int(trunk0.shape[0])
+    x_dim = int(trunk0.shape[1])
+    c_dim = int(film0.shape[1])
+    out_dim = int(head.shape[0])
+    if (out_dim - 1) % 3 != 0:
+        raise RuntimeError(f"Could not infer num_bins from out_dim={out_dim} (expected 3*K+1).")
     num_bins = int((out_dim - 1) // 3)
-    if (3 * num_bins + 1) != out_dim:
-        raise RuntimeError(f"Flow out_dim={out_dim} not compatible with num_bins (expected out_dim=3K+1).")
-    depth = max(1, len(lin_keys_sorted) - 1)
-    return hidden, depth, num_bins
+
+    idxs = []
+    for k in sd.keys():
+        if k.startswith("trunk.") and k.endswith(".weight"):
+            try:
+                idxs.append(int(k.split(".")[1]))
+            except Exception:
+                pass
+    depth = max(1, len(set(idxs)))
+    return "film", hidden, depth, num_bins, x_dim, c_dim
 
 
-def load_models_for_run(run_dir: Path, state, device: torch.device):
-    from risk_pipeline.models import GateMLP, ConditionalSpline1DFlow  # type: ignore
-
+def _load_models_for_run(run_dir: Path, state, device: torch.device):
     gate_ckpt = run_dir / "gate.pt"
     if not gate_ckpt.exists():
         raise FileNotFoundError(f"Missing {gate_ckpt}")
-    gate_sd = _torch_load_sd(gate_ckpt, device=torch.device("cpu"))
+    gate_sd = safe_torch_load(str(gate_ckpt), map_location="cpu")
     in_dim, hidden, depth = _infer_mlp_dims_from_sd(gate_sd)
-    gate = GateMLP(in_dim, hidden=hidden, depth=depth, dropout=0.0).to(device)
+    gate = GateMLP(in_dim=in_dim, hidden=hidden, depth=depth, dropout=0.0).to(device)
     gate.load_state_dict(gate_sd, strict=True)
     gate.eval()
 
@@ -368,735 +249,548 @@ def load_models_for_run(run_dir: Path, state, device: torch.device):
         legacy = run_dir / "expert.pt"
         if legacy.exists():
             flow_ckpt = legacy
+    if not flow_ckpt.exists():
+        raise FileNotFoundError(f"Missing {flow_ckpt}")
+    flow_sd = safe_torch_load(str(flow_ckpt), map_location="cpu")
 
-    if flow_ckpt.exists():
-        flow_sd = _torch_load_sd(flow_ckpt, device=torch.device("cpu"))
-        ctx_dim = len(state.schema.x_expert_cols_in_order())
-        f_hidden, f_depth, num_bins = _infer_flow_hparams_from_sd(flow_sd)
-        expert = ConditionalSpline1DFlow(cond_dim=ctx_dim, num_bins=num_bins, hidden=f_hidden, depth=f_depth, dropout=0.0).to(device)
-        expert.load_state_dict(flow_sd, strict=True)
-        expert.eval()
-        return gate, expert, "flow"
+    cond_mode, f_hidden, f_depth, num_bins, inf_x, inf_c = _infer_flow_arch_and_hparams_from_sd(flow_sd)
 
-    raise FileNotFoundError(f"Cannot find expert checkpoint in {run_dir}")
+    expert_cols = state.schema.x_expert_cols_in_order()
+    cond_dim = int(len(expert_cols))
 
+    if cond_mode == "film":
+        if getattr(state, "flow_x_idx", None) and getattr(state, "flow_c_idx", None):
+            x_dim = int(len(state.flow_x_idx))
+            c_dim = int(len(state.flow_c_idx))
+        elif inf_x > 0 and inf_c > 0 and (inf_x + inf_c == cond_dim):
+            x_dim, c_dim = int(inf_x), int(inf_c)
+        else:
+            raise RuntimeError("FiLM flow detected but could not determine x_dim/c_dim. Ensure preprocess_state has flow_x_idx/flow_c_idx.")
 
-# ----------------------------
-# Inference helpers (same as eval_risk_models_v6.5.py)
-# ----------------------------
-@torch.no_grad()
-def infer_gate_probs(
-    gate: torch.nn.Module,
-    x_gate_raw: torch.Tensor,
-    gate_mean: torch.Tensor,
-    gate_std: torch.Tensor,
-    *,
-    device: torch.device,
-    batch: int,
-) -> np.ndarray:
-    n = x_gate_raw.shape[0]
-    out = np.empty((n,), dtype=np.float32)
-    gate.eval()
-    gate_mean = gate_mean.to(device)
-    gate_std = gate_std.to(device)
+        flow = ConditionalSpline1DFlow(
+            x_dim=x_dim,
+            c_dim=c_dim,
+            cond_mode="film",
+            num_bins=num_bins,
+            hidden=f_hidden,
+            depth=f_depth,
+            dropout=0.0,
+        ).to(device)
+    else:
+        flow = ConditionalSpline1DFlow(
+            cond_dim=cond_dim,
+            cond_mode="concat",
+            num_bins=num_bins,
+            hidden=f_hidden,
+            depth=f_depth,
+            dropout=0.0,
+        ).to(device)
 
-    for i0 in range(0, n, batch):
-        i1 = min(n, i0 + batch)
-        xg_raw = x_gate_raw[i0:i1].to(device)
-        xg = (xg_raw - gate_mean) / (gate_std + 1e-6)
-        logits = gate(xg).reshape(-1)
-        out[i0:i1] = torch.sigmoid(logits).float().detach().cpu().numpy()
-    return out
-
-
-@torch.no_grad()
-def infer_flow_cdf_probs(
-    flow,
-    y_thr_std: torch.Tensor,          # [N]
-    x_ctx_raw: torch.Tensor,          # [N, C] raw
-    expert_mean: torch.Tensor,
-    expert_std: torch.Tensor,
-    *,
-    drop_idx: Optional[torch.Tensor],
-    device: torch.device,
-    batch: int,
-) -> np.ndarray:
-    n = x_ctx_raw.shape[0]
-    out = np.empty((n,), dtype=np.float32)
+    flow.load_state_dict(flow_sd, strict=True)
     flow.eval()
-
-    expert_mean = expert_mean.to(device)
-    expert_std = expert_std.to(device)
-    y_thr_std = y_thr_std.to(device)
-
-    if drop_idx is not None and drop_idx.numel() > 0:
-        drop_idx = drop_idx.to(device)
-
-    for i0 in range(0, n, batch):
-        i1 = min(n, i0 + batch)
-        xe_raw = x_ctx_raw[i0:i1].to(device)
-
-        if drop_idx is not None and drop_idx.numel() > 0:
-            xe_raw = xe_raw.clone()
-            xe_raw[:, drop_idx] = expert_mean[drop_idx]
-
-        xe = (xe_raw - expert_mean) / (expert_std + 1e-6)
-        yb = y_thr_std[i0:i1]
-        cdf = flow.cdf(yb, xe_cond).reshape(-1)
-        out[i0:i1] = cdf.float().detach().cpu().numpy()
-    return out
+    return gate, flow
 
 
-@torch.no_grad()
-def eval_flow_nll_and_pit(
-    flow,
-    y_std: torch.Tensor,
-    x_ctx_raw: torch.Tensor,
-    expert_mean: torch.Tensor,
-    expert_std: torch.Tensor,
-    expert_mask: torch.Tensor,
+def _make_event_label(
+    y_expert_std: torch.Tensor,
     censored_mask: torch.Tensor,
-    *,
-    drop_idx: Optional[torch.Tensor],
-    device: torch.device,
-    batch: int,
-) -> Tuple[float, float, float]:
-    n = x_ctx_raw.shape[0]
-    flow.eval()
-
-    expert_mean = expert_mean.to(device)
-    expert_std = expert_std.to(device)
-    y_std = y_std.to(device)
-    expert_mask = expert_mask.to(device)
-    censored_mask = censored_mask.to(device)
-
-    if drop_idx is not None and drop_idx.numel() > 0:
-        drop_idx = drop_idx.to(device)
-
-    losses = []
-    pits = []
-
-    for i0 in range(0, n, batch):
-        i1 = min(n, i0 + batch)
-        m = (expert_mask[i0:i1] > 0.5)
-        if int(m.sum().item()) < 2:
-            continue
-
-        xe_raw = x_ctx_raw[i0:i1].to(device)
-        if drop_idx is not None and drop_idx.numel() > 0:
-            xe_raw = xe_raw.clone()
-            xe_raw[:, drop_idx] = expert_mean[drop_idx]
-
-        xe = (xe_raw - expert_mean) / (expert_std + 1e-6)
-        yb = y_std[i0:i1][m]
-        xb = xe[m]
-        is_c = (censored_mask[i0:i1][m] > 0.5)
-
-        loss_val = torch.zeros_like(yb)
-
-        mask_u = ~is_c
-        if mask_u.any():
-            loss_val[mask_u] = -flow.log_prob(yb[mask_u], xb[mask_u])
-            pit = flow.cdf(yb[mask_u], xb[mask_u])
-            pits.append(pit.detach().cpu())
-
-        mask_c = is_c
-        if mask_c.any():
-            u, _ = flow.y_to_u(yb[mask_c], xb[mask_c])
-            surv = 0.5 * torch.erfc(u / 1.41421356237)
-            surv = torch.clamp(surv, min=1e-6)
-            loss_val[mask_c] = -torch.log(surv)
-
-        losses.append(loss_val.mean().detach().cpu())
-
-    if not losses:
-        return float("nan"), float("nan"), float("nan")
-
-    nll = float(torch.stack(losses).mean().item())
-    if pits:
-        pit_all = torch.cat(pits, dim=0).numpy()
-        return nll, float(np.mean(pit_all)), float(np.std(pit_all))
-    return nll, float("nan"), float("nan")
-
-
-# ----------------------------
-# Diagnostics helpers (new)
-# ----------------------------
-def _parse_float_list(s: str) -> List[float]:
-    s = (s or "").strip()
-    if not s:
-        return []
-    out = []
-    for tok in s.split(","):
-        tok = tok.strip()
-        if tok:
-            out.append(float(tok))
-    return out
-
-
-def _parse_tau_grid(s: str) -> List[float]:
-    s = (s or "").strip()
-    if not s:
-        return []
-    parts = [p.strip() for p in s.split(":")]
-    if len(parts) != 3:
-        raise ValueError("--tau_grid must be 'start:stop:step'")
-    a, b, step = map(float, parts)
-    if step <= 0:
-        raise ValueError("--tau_grid step must be > 0")
-    vals = []
-    x = a
-    for _ in range(10000):
-        if x > b + 1e-12:
-            break
-        vals.append(float(x))
-        x += step
-    return vals
-
-
-def gate_event_threshold_curve(y_event: np.ndarray, p_gate: np.ndarray, thresholds: List[float]) -> List[dict]:
-    y = y_event.astype(np.int64)
-    P = int(np.sum(y))
-    out = []
-    for thr in thresholds:
-        pred = (p_gate >= float(thr))
-        tp = int(np.sum(pred & (y == 1)))
-        fp = int(np.sum(pred & (y == 0)))
-        fn = int(np.sum((~pred) & (y == 1)))
-        prec = float(tp / (tp + fp)) if (tp + fp) > 0 else float("nan")
-        rec = float(tp / (tp + fn)) if (tp + fn) > 0 else float("nan")
-        out.append(
-            {
-                "thr": float(thr),
-                "P": P,
-                "pred_pos": int(tp + fp),
-                "tp": tp,
-                "fp": fp,
-                "fn": fn,
-                "precision": prec,
-                "recall": rec,
-                "pass_rate": float(np.mean(pred)),
-                "blocked_pos_rate": float(fn / P) if P > 0 else float("nan"),
-            }
-        )
-    return out
-
-
-def threshold_for_target_recall(curve: List[dict], target_recall: float) -> Optional[float]:
-    best = None
-    for row in curve:
-        r = row.get("recall", float("nan"))
-        if not (isinstance(r, float) and np.isfinite(r)):
-            continue
-        if r >= target_recall:
-            t = float(row["thr"])
-            if best is None or t > best:
-                best = t
-    return best
-
-
-def flow_tail_diagnostics(
-    *,
-    flow,
-    ds,
-    df_t: pd.DataFrame,
-    state,
-    expert_mean: torch.Tensor,
-    expert_std: torch.Tensor,
-    drop_idx_t: Optional[torch.Tensor],
-    device: torch.device,
-    batch: int,
-    out_dir: Path,
+    raw_closing_speed_mps: torch.Tensor,
+    target_mu: float,
+    target_sigma: float,
+    tau: float,
+    amax: float,
     ttc_floor: float,
     ttc_cap: float,
-    ttc_cut: float,
-    ttc_hi_cut: float,
-    max_samples: int,
-    grid_n: int,
-) -> Dict[str, Any]:
-    """
-    Saves:
-      - pit_hist.png
-      - ttc_pdf_low_vs_high.png
-      - pit_stats.json
+) -> torch.Tensor:
+    y_log = y_expert_std * (target_sigma + 1e-6) + target_mu
+    ttc = torch.exp(y_log).clamp(min=ttc_floor, max=ttc_cap)
 
-    Returns a dict with summary stats (also useful for JSON aggregation).
-    """
-    out_dir.mkdir(parents=True, exist_ok=True)
+    v = torch.clamp(raw_closing_speed_mps, min=0.0)
+    s = torch.clamp(tau + v / max(amax, 1e-6), min=ttc_floor, max=ttc_cap)
 
-    try:
-        import matplotlib.pyplot as plt  # type: ignore
-    except Exception as e:
-        return {"skipped": True, "reason": f"matplotlib not available: {e}"}
+    is_cens = (censored_mask > 0.5)
+    return ((ttc <= s) & (~is_cens)).float()
 
-    # --- PIT collection (uncensored only, expert_mask==1) ---
-    pits = []
-    n = len(ds)
-    flow.eval()
 
-    expert_mean_d = expert_mean.to(device)
-    expert_std_d = expert_std.to(device)
-    y_std_d = ds.tensors.y_expert.to(device)
-    mask_d = ds.tensors.expert_mask.to(device)
-    cens_d = ds.tensors.censored_mask.to(device)
-    drop_d = drop_idx_t.to(device) if (drop_idx_t is not None and drop_idx_t.numel() > 0) else None
+def _choose_gate_thr_for_recall(p_gate: np.ndarray, y_true: np.ndarray, thresholds: List[float], target_recall: float) -> float:
+    pos = (y_true > 0.5)
+    P = int(np.sum(pos))
+    if P <= 0:
+        return float("nan")
+    best = None
+    for thr in sorted(thresholds):
+        pred = (p_gate >= thr)
+        tp = int(np.sum(pred & pos))
+        rec = tp / max(1, P)
+        if rec >= target_recall:
+            best = thr
+    if best is None:
+        best = float(min(thresholds)) if thresholds else float("nan")
+    return float(best)
 
-    for i0 in range(0, n, batch):
-        i1 = min(n, i0 + batch)
-        m = (mask_d[i0:i1] > 0.5) & (cens_d[i0:i1] < 0.5)
-        if int(m.sum().item()) < 2:
-            continue
-        xe_raw = ds.tensors.x_expert_raw[i0:i1].to(device)
-        if drop_d is not None:
-            xe_raw = xe_raw.clone()
-            xe_raw[:, drop_d] = expert_mean_d[drop_d]
-        xe = (xe_raw - expert_mean_d) / (expert_std_d + 1e-6)
-        yb = y_std_d[i0:i1][m]
-        xb = xe[m]
-        pit = flow.cdf(yb, xb_cond).reshape(-1)
-        pits.append(pit.detach().cpu().numpy())
 
-    pit_all = np.concatenate(pits, axis=0) if pits else np.zeros((0,), dtype=np.float32)
-
-    if pit_all.size > 0:
-        plt.figure()
-        plt.hist(pit_all, bins=20)
-        plt.title("PIT histogram (uncensored only)")
-        plt.xlabel("PIT = CDF(y_true | x)")
-        plt.ylabel("count")
-        plt.tight_layout()
-        plt.savefig(out_dir / "pit_hist.png", dpi=160)
-        plt.close()
-
-        pit_sorted = np.sort(pit_all)
-        u = (np.arange(1, pit_sorted.size + 1) - 0.5) / pit_sorted.size
-        ks = float(np.max(np.abs(pit_sorted - u)))
-
-        (out_dir / "pit_stats.json").write_text(
-            json.dumps(
-                {
-                    "N_pit": int(pit_all.size),
-                    "pit_mean": float(np.mean(pit_all)),
-                    "pit_std": float(np.std(pit_all)),
-                    "ks_uniform": ks,
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-    else:
-        (out_dir / "pit_stats.json").write_text(json.dumps({"N_pit": 0, "note": "no uncensored expert samples"}, indent=2), encoding="utf-8")
-
-    # --- Conditional TTC PDF: low vs high TTC ---
-    ttc_raw = compute_ttc(df_t, eps=1e-6)
-    ttc_clip = np.clip(ttc_raw, ttc_floor, ttc_cap)
-
-    base = (ds.tensors.expert_mask.detach().cpu().numpy() > 0.5) & (ds.tensors.censored_mask.detach().cpu().numpy() < 0.5)
-    m_low = base & (ttc_clip <= float(ttc_cut))
-    m_hi  = base & (ttc_clip >= float(ttc_hi_cut))
-
-    rng = np.random.default_rng(0)
-    idx_low = np.where(m_low)[0]
-    idx_hi  = np.where(m_hi)[0]
-    if idx_low.size > max_samples:
-        idx_low = rng.choice(idx_low, size=max_samples, replace=False)
-    if idx_hi.size > max_samples:
-        idx_hi = rng.choice(idx_hi, size=max_samples, replace=False)
-
-    t_grid = np.linspace(ttc_floor, ttc_cap, int(grid_n))
-    y_grid = np.log(t_grid + 1e-9)
-
-    mu_y = float(state.target_std.mu_y)
-    sig_y = float(state.target_std.sigma_y)
-    eps_y = float(getattr(state.target_std, "eps", 1e-6))
-    y_grid_std = (y_grid - mu_y) / (sig_y + eps_y)
-
-    y_grid_std_t = torch.tensor(y_grid_std, dtype=torch.float32, device=device)
-
-    def _avg_pdf(idxs: np.ndarray) -> Optional[np.ndarray]:
-        if idxs.size == 0:
-            return None
-        xe_raw = ds.tensors.x_expert_raw[idxs].to(device)
-        if drop_d is not None:
-            xe_raw = xe_raw.clone()
-            xe_raw[:, drop_d] = expert_mean_d[drop_d]
-        xe = (xe_raw - expert_mean_d) / (expert_std_d + 1e-6)  # [B,C]
-        B = xe.shape[0]
-        G = y_grid_std_t.shape[0]
-
-        xe_rep = xe[:, None, :].expand(B, G, xe.shape[1]).reshape(B * G, xe.shape[1])
-        y_rep  = y_grid_std_t[None, :].expand(B, G).reshape(B * G)
-
-        logp_y_std = flow.log_prob(y_rep, xe_rep).reshape(B, G)  # density w.r.t y_std
-
-        # Convert to TTC density: p(t) = p(y_std) * (1/sigma) * (1/t)
-        p_t = torch.exp(logp_y_std) / (sig_y + eps_y)
-        p_t = p_t / torch.tensor(t_grid, dtype=torch.float32, device=device)[None, :]
-
-        return p_t.mean(dim=0).detach().cpu().numpy()
-
-    pdf_low = _avg_pdf(idx_low)
-    pdf_hi = _avg_pdf(idx_hi)
-
-    plt.figure()
-    if pdf_low is not None:
-        plt.plot(t_grid, pdf_low, label=f"TTC <= {ttc_cut}s (n={int(idx_low.size)})")
-    if pdf_hi is not None:
-        plt.plot(t_grid, pdf_hi, label=f"TTC >= {ttc_hi_cut}s (n={int(idx_hi.size)})")
-    plt.title("Conditional predicted TTC PDF (flow)")
-    plt.xlabel("TTC (s)")
-    plt.ylabel("density")
-    plt.legend()
+def _plot_pit(u: np.ndarray, out_path: str) -> Dict[str, float]:
+    u = np.clip(u, 0.0, 1.0)
+    plt.figure(figsize=(5, 4))
+    plt.hist(u, bins=20, range=(0, 1), density=True)
+    plt.axhline(1.0, linestyle="--")
+    plt.title("PIT histogram (uniform = calibrated density)")
     plt.tight_layout()
-    plt.savefig(out_dir / "ttc_pdf_low_vs_high.png", dpi=160)
+    plt.savefig(out_path)
+    plt.close()
+    return {"u_mean": float(np.mean(u)) if u.size else float("nan"),
+            "u_std": float(np.std(u)) if u.size else float("nan")}
+
+
+
+def _save_calibration_curve(
+    y_true: np.ndarray,
+    p_pred: np.ndarray,
+    out_png: str,
+    out_csv: str,
+    n_bins: int = 15,
+) -> Dict[str, float]:
+    """
+    Reliability diagram for predicted probability p_pred vs empirical event rate.
+    Returns summary stats including ECE (same binning), Brier.
+    """
+    y_true = y_true.astype(np.float64).reshape(-1)
+    p_pred = np.clip(p_pred.astype(np.float64).reshape(-1), 0.0, 1.0)
+    if y_true.size == 0:
+        return {"ece": float("nan"), "brier": float("nan")}
+
+    bins = np.linspace(0.0, 1.0, n_bins + 1)
+    rows = []
+    ece_val = 0.0
+    for i in range(n_bins):
+        lo, hi = bins[i], bins[i + 1]
+        m = (p_pred >= lo) & (p_pred < hi) if i < n_bins - 1 else (p_pred >= lo) & (p_pred <= hi)
+        if not np.any(m):
+            rows.append({"bin": i, "lo": lo, "hi": hi, "n": 0, "p_mean": float("nan"), "y_rate": float("nan")})
+            continue
+        p_mean = float(np.mean(p_pred[m]))
+        y_rate = float(np.mean(y_true[m]))
+        n = int(np.sum(m))
+        rows.append({"bin": i, "lo": lo, "hi": hi, "n": n, "p_mean": p_mean, "y_rate": y_rate})
+        ece_val += (n / y_true.size) * abs(y_rate - p_mean)
+
+    brier_val = float(np.mean((p_pred - y_true) ** 2))
+
+    # Save CSV
+    pd.DataFrame(rows).to_csv(out_csv, index=False)
+
+    # Plot reliability
+    xs = [r["p_mean"] for r in rows if r["n"] > 0]
+    ys = [r["y_rate"] for r in rows if r["n"] > 0]
+    ns = [r["n"] for r in rows if r["n"] > 0]
+
+    plt.figure(figsize=(5, 4))
+    if len(xs) > 0:
+        plt.plot(xs, ys, marker="o")
+    plt.plot([0, 1], [0, 1], linestyle="--")
+    plt.xlabel("Mean predicted p_event")
+    plt.ylabel("Empirical event rate")
+    plt.title(f"p_event calibration (bins={n_bins})")
+    plt.tight_layout()
+    plt.savefig(out_png)
     plt.close()
 
-    return {
-        "skipped": False,
-        "N_pit": int(pit_all.size),
-        "N_low": int(idx_low.size),
-        "N_high": int(idx_hi.size),
-    }
+    return {"ece": float(ece_val), "brier": float(brier_val)}
+
+
+def _ks_cdf_u_vs_uniform(u: np.ndarray) -> float:
+    """KS distance between empirical CDF of u and Uniform(0,1) CDF (which is u)."""
+    u = np.clip(u.astype(np.float64).reshape(-1), 0.0, 1.0)
+    if u.size == 0:
+        return float("nan")
+    us = np.sort(u)
+    ecdf = (np.arange(1, us.size + 1, dtype=np.float64) / us.size)
+    ks = float(np.max(np.abs(ecdf - us)))
+    return ks
+
+
+def _save_ks_plot_u_vs_uniform(u: np.ndarray, out_png: str) -> Dict[str, float]:
+    u = np.clip(u.astype(np.float64).reshape(-1), 0.0, 1.0)
+    if u.size == 0:
+        plt.figure(figsize=(5, 4))
+        plt.plot([0, 1], [0, 1], linestyle="--")
+        plt.title("Empirical CDF(u) vs Uniform CDF (empty)")
+        plt.tight_layout()
+        plt.savefig(out_png)
+        plt.close()
+        return {"ks": float("nan"), "n": 0}
+
+    us = np.sort(u)
+    ecdf = (np.arange(1, us.size + 1, dtype=np.float64) / us.size)
+    ks = float(np.max(np.abs(ecdf - us)))
+
+    plt.figure(figsize=(5, 4))
+    plt.plot(us, ecdf, label="Empirical CDF(u)")
+    plt.plot([0, 1], [0, 1], linestyle="--", label="Uniform CDF")
+    plt.xlabel("u = F_model(y|cond)")
+    plt.ylabel("CDF")
+    plt.title(f"KS(CDF_u, Uniform) = {ks:.4f} (n={us.size})")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_png)
+    plt.close()
+
+    return {"ks": float(ks), "n": int(us.size), "u_mean": float(np.mean(u)), "u_std": float(np.std(u))}
+
+
+def _repeat_cond_for_grid(cond, n: int):
+    """Repeat a single-sample condition to match a grid of size n."""
+    if isinstance(cond, (tuple, list)):
+        x, c = cond
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+        if c.dim() == 1:
+            c = c.unsqueeze(0)
+        return (x.repeat(n, 1), c.repeat(n, 1))
+    else:
+        if cond.dim() == 1:
+            cond = cond.unsqueeze(0)
+        return cond.repeat(n, 1)
+
+
+def _plot_ttc_pdf_low_vs_high(
+    flow: ConditionalSpline1DFlow,
+    cond_low,
+    cond_high,
+    target_mu: float,
+    target_sigma: float,
+    ttc_floor: float,
+    ttc_cap: float,
+    out_path: str,
+) -> None:
+    # Grid of TTC, converted to standardized log(TTC)
+    device = next(flow.parameters()).device
+    t = torch.linspace(float(ttc_floor), float(ttc_cap), 240, device=device)
+    y_log = torch.log(t + 1e-9)
+    y_std = (y_log - target_mu) / (target_sigma + 1e-6)  # (G,)
+
+    # IMPORTANT: match batch sizes (G) for y_std and cond
+    G = int(y_std.numel())
+    cond_low_g = _repeat_cond_for_grid(cond_low, G)
+    cond_high_g = _repeat_cond_for_grid(cond_high, G)
+
+    with torch.no_grad():
+        # >>> MUST pass cond_low_g / cond_high_g (NOT cond_low/cond_high)
+        logp_low = flow.log_prob(y_std, cond_low_g)
+        logp_high = flow.log_prob(y_std, cond_high_g)
+        pz_low = logp_low.exp().detach().cpu().numpy().reshape(-1)
+        pz_high = logp_high.exp().detach().cpu().numpy().reshape(-1)
+
+    # Convert PDF over standardized log(TTC) to approximate PDF over TTC
+    sigma = float(target_sigma + 1e-6)
+    t_np = t.detach().cpu().numpy().reshape(-1)
+    jac = 1.0 / (t_np * sigma)
+    pt_low = pz_low * jac
+    pt_high = pz_high * jac
+
+    plt.figure(figsize=(5, 4))
+    plt.plot(t_np, pt_low, label="low-TTC cond")
+    plt.plot(t_np, pt_high, label="high-TTC cond")
+    plt.xlabel("TTC (s)")
+    plt.ylabel("PDF (approx)")
+    plt.title("Flow implied TTC PDF (2 conditions)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
 
 
 @torch.no_grad()
 def main():
+    print("[diagnose] VERSION: antigravity_final5")
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=True)
-    ap.add_argument("--run", action="append", required=True, help="Run directory (repeatable)")
-    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--split", default="val", choices=["train", "val", "test"])
-
+    ap.add_argument("--run", required=True)
+    ap.add_argument("--split", default="val", choices=["train", "val", "test", "all"])
     ap.add_argument("--ttc_floor", type=float, default=0.05)
-    ap.add_argument("--ttc_cap", type=float, default=8.0)
-
-    ap.add_argument("--x_to_c_regex", type=str, default="",
-                    help="Comma-separated regex. Matching x__* columns will be renamed to c__* before preprocessing.")
-    ap.add_argument("--expert_drop_feature_regex", type=str, default="",
-                    help="Comma-separated regex. Matching expert feature columns will be hard-dropped (set to train-mean) for flow, in diagnostics.")
-
-    ap.add_argument("--label_mode", default="ttc_sstar", choices=["ttc_sstar", "ttc_fixed", "gate_clean"])
-    ap.add_argument("--sstar_mode", default="closing_speed", choices=["closing_speed", "ego_speed"])
-    ap.add_argument("--tau", type=float, default=0.5)
+    ap.add_argument("--ttc_cap", type=float, default=10.0)
+    ap.add_argument("--label_mode", default="ttc_sstar")
+    ap.add_argument("--sstar_mode", default="closing_speed")
     ap.add_argument("--amax", type=float, default=6.0)
-    ap.add_argument("--fixed_ttc", type=float, default=2.0)
-
-    ap.add_argument("--require_edges", action="store_true", default=True)
-    ap.add_argument("--no_require_edges", dest="require_edges", action="store_false")
-
-    # ---- new: tau sweep ----
-    ap.add_argument("--tau_sweep", default=None, help="Comma-separated tau list (e.g., 0.1,0.3,0.5,1.0)")
-    ap.add_argument("--tau_grid", default=None, help="Grid start:stop:step (e.g., 0.1:1.0:0.1)")
-
-    # ---- new: gate recall bottleneck ----
+    ap.add_argument("--tau_sweep", default="0.5")
     ap.add_argument("--gate_thresholds", default="0.05,0.1,0.15,0.2,0.25,0.3,0.4,0.5")
     ap.add_argument("--gate_target_recall", type=float, default=0.90)
-
-    # TTC-bin diagnostic
-    ap.add_argument("--ttc_bins", type=int, default=6)
-
-    # performance/output
-    ap.add_argument("--batch", type=int, default=4096)
-    ap.add_argument("--out_dir", default=None, help="If set, save under <out_dir>/<run_name>/ ...")
+    ap.add_argument("--out_dir", required=True)
+    ap.add_argument("--flow_diag_dir", required=True)
     ap.add_argument("--save_preds", action="store_true")
-    ap.add_argument("--no_save", action="store_true")
-
-    # ---- new: flow tail diagnostics ----
-    ap.add_argument("--flow_diag_dir", default=None)
-    ap.add_argument("--flow_ttc_cut", type=float, default=3.0)
-    ap.add_argument("--flow_ttc_hi_cut", type=float, default=5.0)
-    ap.add_argument("--flow_diag_max_samples", type=int, default=512)
-    ap.add_argument("--flow_diag_grid_n", type=int, default=200)
-
+    ap.add_argument("--calib_bins", type=int, default=15, help="Number of bins for p_event calibration curve")
+    ap.add_argument("--calib_on_gated_only", action="store_true", help="If set, compute calibration only on gated subset (p_gate>=thr)")
+    ap.add_argument("--ks_on_gated_only", action="store_true", help="If set, compute PIT-KS only on gated subset (p_gate>=thr)")
+    ap.add_argument("--skip_flow_pdf", action="store_true", help="Skip TTC PDF plot (only PIT)")
+    ap.add_argument("--expert_keep_c_cont", action="store_true")
+    ap.add_argument("--expert_drop_all_context", action="store_true")
+    ap.add_argument("--expert_drop_feature_regex", type=str, default="")
+    ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--max_rows", type=int, default=0)
     args = ap.parse_args()
 
-    df_all = pd.read_csv(args.csv)
-    assert "segment_id" in df_all.columns
-    assert ("y_soft" in df_all.columns) or ("min_ttc_est" in df_all.columns)
+    run_dir = Path(args.run)
+    _ensure_dir(args.out_dir)
+    _ensure_dir(args.flow_diag_dir)
+
+    taus = [float(x) for x in args.tau_sweep.split(",") if str(x).strip()]
+    gate_thresholds = [float(x) for x in args.gate_thresholds.split(",") if str(x).strip()]
+
+    # preprocess_state.json file path
+    state_path = run_dir / "preprocess_state.json"
+    if not state_path.exists():
+        raise FileNotFoundError(f"Missing preprocess_state.json: {state_path}")
+    state = load_preprocess_state(str(state_path))
+
+    # load CSV + split
+    header = pd.read_csv(args.csv, nrows=0)
+    dtypes = {c: np.float32 for c in header.columns if c != "segment_id"}
+    dtypes["segment_id"] = str
+    df = pd.read_csv(args.csv, dtype=dtypes)
+
+    split_map = _load_split_map(str(run_dir))
+    df = _filter_df_by_split(df, split_map, args.split)
+
+    if args.max_rows and args.max_rows > 0 and len(df) > args.max_rows:
+        df = df.sample(n=int(args.max_rows), random_state=0).copy()
+
+    df_t = transform_dataframe(df, state, ttc_floor=args.ttc_floor, ttc_cap=args.ttc_cap)
+    ds = RiskCSVDataset(df_t, state, ttc_floor=args.ttc_floor, ttc_cap=args.ttc_cap)
 
     device = torch.device(args.device)
+    gate, flow = _load_models_for_run(run_dir, state, device=device)
 
-    from risk_pipeline.schema import load_schema
-    from risk_pipeline.preprocess import load_preprocess_state, transform_dataframe
-    from risk_pipeline.data import RiskCSVDataset
+    scale = ds.get_scale_tensors(device=device)
+    gate_mean, gate_std = scale["gate_mean"], scale["gate_std"]
+    expert_mean, expert_std = scale["expert_mean"], scale["expert_std"]
 
-    # tau list
-    if args.tau_sweep:
-        tau_list = _parse_float_list(args.tau_sweep)
-    elif args.tau_grid:
-        tau_list = _parse_tau_grid(args.tau_grid)
-    else:
-        tau_list = [float(args.tau)]
-    if not tau_list:
-        tau_list = [float(args.tau)]
-    sweep_mode = len(tau_list) > 1
+    xg_raw = ds.tensors.x_gate_raw.to(device)
+    xe_raw = ds.tensors.x_expert_raw.to(device)
 
-    gate_thr_list = _parse_float_list(args.gate_thresholds)
-    if not gate_thr_list:
-        gate_thr_list = [0.1, 0.2, 0.3, 0.5]
+    # y_expert must be 1D (N,)
+    y_expert = ds.tensors.y_expert.to(device).reshape(-1)
+    censored_mask = ds.tensors.censored_mask.to(device).reshape(-1)
+    v_close = ds.tensors.raw_closing_speed_mps.to(device).reshape(-1)
 
-    all_results: Dict[str, dict] = {}
-    summary_rows: List[dict] = []
+    # scale gate
+    xg = (xg_raw - gate_mean) / (gate_std + 1e-6)
 
-    for run in args.run:
-        run_dir = Path(run)
-        split = load_segment_split(run_dir)
-        segs = split[args.split]
-        df_split = pick_split_df(df_all, segs)
+    # apply expert drops (must match train)
+    expert_colnames = ds.get_x_expert_colnames()
+    drop_idx: List[int] = []
 
-        if "frame_label" not in df_split.columns:
-            df_split["frame_label"] = np.arange(len(df_split), dtype=np.int64)
-
-        _ = load_schema(str(run_dir / "feature_schema.json"))
-        state = load_preprocess_state(str(run_dir / "preprocess_state.json"))
-        df_t = transform_dataframe(df_split, state, ttc_floor=args.ttc_floor, ttc_cap=args.ttc_cap)
-
-        ds = RiskCSVDataset(df_t, state, ttc_floor=args.ttc_floor, ttc_cap=args.ttc_cap)
-
-        scale = ds.get_scale_tensors("cpu")
-        gate_mean, gate_std = scale["gate_mean"], scale["gate_std"]
-        expert_mean, expert_std = scale["expert_mean"], scale["expert_std"]
-
-        drop_idx = sorted(set(getattr(state, "drop_context_idx_expert", []) or []))
-        extra_drop_patterns = _parse_csv_list(args.expert_drop_feature_regex)
-        if extra_drop_patterns:
-            expert_colnames = ds.get_x_expert_colnames()
-            extra_cols = _match_cols_by_regex(expert_colnames, extra_drop_patterns)
-            if extra_cols:
-                extra_idx = [expert_colnames.index(c) for c in extra_cols]
-                print(f"[expert_drop_feature_regex] hard-drop {len(extra_idx)} expert cols. Example: {extra_cols[:10]}")
-                drop_idx = sorted(set(drop_idx + extra_idx))
-        drop_idx_t = torch.tensor(drop_idx, dtype=torch.long) if len(drop_idx) else None
-
-        gate, expert, expert_type = load_models_for_run(run_dir, state, device=device)
-        if expert_type != "flow":
-            raise RuntimeError("This diagnostics script currently expects flow expert.")
-
-        # gate inference (tau-independent)
-        p_gate = infer_gate_probs(gate, ds.tensors.x_gate_raw, gate_mean, gate_std, device=device, batch=args.batch)
-
-        # expert diagnostics (tau-independent)
-        expert_nll, pit_mean, pit_std = eval_flow_nll_and_pit(
-            expert,
-            ds.tensors.y_expert,
-            ds.tensors.x_expert_raw,
-            expert_mean,
-            expert_std,
-            ds.tensors.expert_mask,
-            ds.tensors.censored_mask,
-            drop_idx=drop_idx_t,
-            device=device,
-            batch=args.batch,
+    if not args.expert_keep_c_cont:
+        drop_idx.extend(
+            i for i, c in enumerate(expert_colnames)
+            if c.startswith("c__") and ("=" not in c) and (not c.startswith("c__has_"))
         )
 
-        # optional flow plots
-        if args.flow_diag_dir:
-            flow_out = Path(args.flow_diag_dir) / run_dir.name / args.split
-            diag_stats = flow_tail_diagnostics(
-                flow=expert,
-                ds=ds,
-                df_t=df_t,
-                state=state,
-                expert_mean=expert_mean,
-                expert_std=expert_std,
-                drop_idx_t=drop_idx_t,
-                device=device,
-                batch=args.batch,
-                out_dir=flow_out,
-                ttc_floor=args.ttc_floor,
-                ttc_cap=args.ttc_cap,
-                ttc_cut=args.flow_ttc_cut,
-                ttc_hi_cut=args.flow_ttc_hi_cut,
-                max_samples=args.flow_diag_max_samples,
-                grid_n=args.flow_diag_grid_n,
-            )
+    if getattr(state, "drop_context_idx_expert", None):
+        drop_idx.extend(list(state.drop_context_idx_expert))
+
+    if args.expert_drop_all_context:
+        drop_idx.extend([i for i, c in enumerate(expert_colnames) if c.startswith("c__")])
+
+    if args.expert_drop_feature_regex:
+        import re
+        regs = [re.compile(p.strip()) for p in args.expert_drop_feature_regex.split(",") if p.strip()]
+        for i, c in enumerate(expert_colnames):
+            if any(r.search(c) for r in regs):
+                drop_idx.append(i)
+
+    drop_idx = sorted(set(int(i) for i in drop_idx))
+    if drop_idx:
+        idx_t = torch.tensor(drop_idx, dtype=torch.long, device=device)
+        xe_raw = xe_raw.clone()
+        xe_raw[:, idx_t] = expert_mean[idx_t]
+
+    xe = (xe_raw - expert_mean) / (expert_std + 1e-6)
+
+    # cond for flow (concat or film)
+    cond = _make_flow_cond(
+        xe,
+        flow,
+        flow_x_idx=getattr(state, "flow_x_idx", None),
+        flow_c_idx=getattr(state, "flow_c_idx", None),
+    )
+
+    # gate forward
+    gate_logits = gate(xg)
+    p_gate = torch.sigmoid(gate_logits).reshape(-1)
+
+    # -------------------------
+    # Flow diagnostics (tau-independent)
+    # -------------------------
+    diag_subdir = os.path.join(args.flow_diag_dir, run_dir.name, args.split)
+    _ensure_dir(diag_subdir)
+
+    u, _ = flow.y_to_u(y_expert, cond)
+    u_np = u.detach().cpu().numpy().reshape(-1)
+
+    pit_png = os.path.join(diag_subdir, "pit_hist.png")
+    pit_stats = _plot_pit(u_np, pit_png)
+    with open(os.path.join(diag_subdir, "pit_stats.json"), "w", encoding="utf-8") as f:
+        json.dump(pit_stats, f, indent=2)
+
+    if not args.skip_flow_pdf:
+        y_np = y_expert.detach().cpu().numpy()
+        low_i = int(np.argmin(y_np))
+        high_i = int(np.argmax(y_np))
+
+        if isinstance(cond, (tuple, list)):
+            cond_low = (cond[0][low_i:low_i+1], cond[1][low_i:low_i+1])
+            cond_high = (cond[0][high_i:high_i+1], cond[1][high_i:high_i+1])
         else:
-            diag_stats = {"skipped": True}
+            cond_low = cond[low_i:low_i+1]
+            cond_high = cond[high_i:high_i+1]
 
-        # output base
-        if args.out_dir:
-            out_base = Path(args.out_dir) / run_dir.name
+        pdf_png = os.path.join(diag_subdir, "ttc_pdf_low_vs_high.png")
+        _plot_ttc_pdf_low_vs_high(
+            flow, cond_low, cond_high,
+            target_mu=float(state.target_std.mu_y),
+            target_sigma=float(state.target_std.sigma_y),
+            ttc_floor=float(args.ttc_floor),
+            ttc_cap=float(args.ttc_cap),
+            out_path=pdf_png,
+        )
+
+    # -------------------------
+    # Tau sweep
+    # -------------------------
+    rows = []
+
+    for tau in taus:
+        cfg = RiskConfig(tau=float(tau), a_max=float(args.amax), ttc_floor=float(args.ttc_floor), ttc_cap=float(args.ttc_cap))
+
+        risk, p_gate_out = compute_risk(
+            gate_logits=gate_logits,
+            expert_flow=flow,
+            x_expert_scaled=cond,
+            raw_closing_speed_mps=v_close,
+            target_std=state.target_std,
+            cfg=cfg,
+        )
+        risk = risk.reshape(-1)
+        p_gate_out = p_gate_out.reshape(-1)
+
+        v = torch.clamp(v_close, min=0.0)
+        s = torch.clamp(cfg.tau + v / max(cfg.a_max, 1e-6), min=cfg.ttc_floor, max=cfg.ttc_cap)
+        y_thr = torch.log(s + 1e-9)  # 1D
+        y_thr_std = (y_thr - float(state.target_std.mu_y)) / (float(state.target_std.sigma_y) + 1e-6)
+        p_event = flow.cdf(y_thr_std, cond).reshape(-1)
+
+        y_true = _make_event_label(
+            y_expert_std=y_expert,
+            censored_mask=censored_mask,
+            raw_closing_speed_mps=v_close,
+            target_mu=float(state.target_std.mu_y),
+            target_sigma=float(state.target_std.sigma_y),
+            tau=float(tau),
+            amax=float(args.amax),
+            ttc_floor=float(args.ttc_floor),
+            ttc_cap=float(args.ttc_cap),
+        ).reshape(-1)
+
+        y_true_np = y_true.detach().cpu().numpy().astype(np.int64)
+        risk_np = risk.detach().cpu().numpy()
+        p_gate_np = p_gate_out.detach().cpu().numpy()
+        p_event_np = p_event.detach().cpu().numpy()
+
+        pos_rate = float(np.mean(y_true_np)) if y_true_np.size else float("nan")
+
+        pr = pr_auc_average_precision(y_true_np, risk_np)
+        roc = roc_auc_trapezoid(y_true_np, risk_np)
+        brier = float(np.mean((risk_np - y_true_np) ** 2)) if y_true_np.size else float("nan")
+        e = ece(y_true_np, risk_np, n_bins=15)
+
+        gate_thr = _choose_gate_thr_for_recall(p_gate_np, y_true_np, gate_thresholds, float(args.gate_target_recall))
+
+        out = {
+            "run_name": run_dir.name,
+            "split": args.split,
+            "tau": float(tau),
+            "amax": float(args.amax),
+            "N": int(y_true_np.size),
+            "pos_rate": float(pos_rate),
+            "risk_pr_auc": float(pr),
+            "risk_roc_auc": float(roc),
+            "risk_brier": float(brier),
+            "risk_ece": float(e),
+            "p_gate_mean": float(np.mean(p_gate_np)) if p_gate_np.size else float("nan"),
+            "p_event_mean": float(np.mean(p_event_np)) if p_event_np.size else float("nan"),
+            "gate_thr_for_target_recall": float(gate_thr),
+        }
+
+        # ---- tau-specific diagnostics (p_event calibration + KS) ----
+        # Define gating mask using target-recall threshold (tau-dependent because y_true depends on tau)
+        if np.isfinite(gate_thr):
+            gated_mask = (p_gate_np >= gate_thr)
         else:
-            out_base = run_dir
-        out_base.mkdir(parents=True, exist_ok=True)
+            gated_mask = np.ones_like(p_gate_np, dtype=bool)
 
-        # sweep results table
-        sweep_table = []
+        # Calibration curve target: p_event vs y_true (optionally on gated subset only)
+        if args.calib_on_gated_only:
+            y_cal = y_true_np[gated_mask]
+            p_cal = p_event_np[gated_mask]
+        else:
+            y_cal = y_true_np
+            p_cal = p_event_np
 
-        y_gate_true = ds.tensors.y_gate.detach().cpu().numpy().astype(np.int64)
+        tau_dir = os.path.join(diag_subdir, f"tau_{tau}")
+        _ensure_dir(tau_dir)
 
-        for tau_val in tau_list:
-            # y_event depends on tau
-            y_event = build_event_label(
-                df_t,
-                ttc_floor=args.ttc_floor,
-                ttc_cap=args.ttc_cap,
-                label_mode=args.label_mode,
-                sstar_mode=args.sstar_mode,
-                tau=float(tau_val),
-                amax=args.amax,
-                fixed_ttc=args.fixed_ttc,
-                require_edges=args.require_edges,
-                y_gate_proxy=y_gate_true,
-            )
+        calib_png = os.path.join(tau_dir, "p_event_calibration.png")
+        calib_csv = os.path.join(tau_dir, "p_event_calibration.csv")
+        calib_stats = _save_calibration_curve(y_cal, p_cal, calib_png, calib_csv, n_bins=int(args.calib_bins))
 
-            # threshold -> standardized log TTC
-            thr_ttc = build_event_threshold_ttc(
-                df_t,
-                ttc_cap=args.ttc_cap,
-                label_mode=args.label_mode,
-                sstar_mode=args.sstar_mode,
-                tau=float(tau_val),
-                amax=args.amax,
-                fixed_ttc=args.fixed_ttc,
-            )
-            thr_ttc = np.clip(thr_ttc, args.ttc_floor, args.ttc_cap)
-            thr_log = np.log(thr_ttc + 1e-9)
-            mu_y = float(state.target_std.mu_y)
-            sig_y = float(state.target_std.sigma_y)
-            eps_y = float(getattr(state.target_std, "eps", 1e-6))
-            y_thr_std = (thr_log - mu_y) / (sig_y + eps_y)
-            y_thr_std_t = torch.tensor(y_thr_std, dtype=torch.float32)
+        # KS distance: empirical CDF of PIT u vs Uniform (optionally on gated subset only)
+        if args.ks_on_gated_only:
+            u_use = u_np[gated_mask]
+        else:
+            u_use = u_np
 
-            # p_event via exact CDF
-            p_event = infer_flow_cdf_probs(
-                expert,
-                y_thr_std_t,
-                ds.tensors.x_expert_raw,
-                expert_mean,
-                expert_std,
-                drop_idx=drop_idx_t,
-                device=device,
-                batch=args.batch,
-            )
+        ks_png = os.path.join(tau_dir, "pit_ks_cdf.png")
+        ks_stats = _save_ks_plot_u_vs_uniform(u_use, ks_png)
 
-            risk_prob = np.clip(p_gate * p_event, 0.0, 1.0)
+        # Attach these tau diagnostics to the summary json
+        out["p_event_calib_ece"] = float(calib_stats.get("ece", float("nan")))
+        out["p_event_calib_brier"] = float(calib_stats.get("brier", float("nan")))
+        out["pit_ks_u_uniform"] = float(ks_stats.get("ks", float("nan")))
+        out["pit_ks_n"] = int(ks_stats.get("n", 0))
 
-            gate_curve = gate_event_threshold_curve(y_event, p_gate, gate_thr_list)
-            thr_for_target = threshold_for_target_recall(gate_curve, float(args.gate_target_recall))
+        out_path = os.path.join(args.out_dir, f"{run_dir.name}_diag_{args.split}_tau{tau}.json")
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(out, f, indent=2)
 
-            # TTC-bin diag
-            ttc_clip = np.clip(compute_ttc(df_t, eps=1e-6), args.ttc_floor, args.ttc_cap)
-            logttc = np.log(ttc_clip + 1e-9)
-            bins = np.quantile(logttc, np.linspace(0, 1, args.ttc_bins + 1))
-            bin_rows = []
-            for i in range(args.ttc_bins):
-                lo, hi = float(bins[i]), float(bins[i + 1])
-                m = (logttc >= lo) & (logttc <= hi if i == args.ttc_bins - 1 else logttc < hi)
-                if int(np.sum(m)) < 200:
-                    continue
-                bin_rows.append(
-                    {
-                        "bin": int(i),
-                        "N": int(np.sum(m)),
-                        "logttc_lo": lo,
-                        "logttc_hi": hi,
-                        "event_rate": float(np.mean(y_event[m])),
-                        "risk_mean": float(np.mean(risk_prob[m])),
-                        "p_gate_mean": float(np.mean(p_gate[m])),
-                        "p_event_mean": float(np.mean(p_event[m])),
-                    }
-                )
+        if args.save_preds:
+            pred_df = pd.DataFrame({
+                "segment_id": ds.tensors.segment_ids,
+                "frame_label": ds.tensors.frame_label.cpu().numpy(),
+                "y_event": y_true_np,
+                "p_gate": p_gate_np,
+                "p_event": p_event_np,
+                "risk": risk_np,
+                "raw_closing_speed_mps": ds.tensors.raw_closing_speed_mps.cpu().numpy(),
+                "censored": (ds.tensors.censored_mask.cpu().numpy() > 0.5).astype(np.int64),
+            })
+            pred_path = os.path.join(args.out_dir, f"preds_{run_dir.name}_{args.split}_tau{tau}.csv")
+            pred_df.to_csv(pred_path, index=False)
 
-            res = {
-                "run": str(run_dir),
-                "run_name": run_dir.name,
-                "split": args.split,
-                "tau": float(tau_val),
-                "amax": float(args.amax),
-                "N": int(len(df_t)),
-                "pos_rate": float(np.mean(y_event)),
+        rows.append(out)
 
-                # gate metrics (training label)
-                "gate_pr_auc": _safe_prauc(y_gate_true, p_gate),
-                "gate_roc_auc": _safe_auc(y_gate_true, p_gate),
-                "gate_brier": brier(y_gate_true, p_gate),
-                "gate_ece": ece(y_gate_true, p_gate),
+        print(
+            f"[OK] {run_dir.name} split={args.split} tau={tau} "
+            f"pos={pos_rate:.4f} PR-AUC={pr:.4f} ROC-AUC={roc:.4f} Brier={brier:.4f} "
+            f"p_gate_mean={out['p_gate_mean']:.3f} p_event_mean={out['p_event_mean']:.3f} "
+            f"gate_thr@recall{args.gate_target_recall:.2f}={gate_thr}"
+        )
 
-                # risk metrics (event label)
-                "risk_label_mode": args.label_mode,
-                "risk_pr_auc": _safe_prauc(y_event, risk_prob),
-                "risk_roc_auc": _safe_auc(y_event, risk_prob),
-                "risk_brier": brier(y_event, risk_prob),
-                "risk_ece": ece(y_event, risk_prob),
-
-                # expert diagnostics (tau-independent)
-                "expert_type": "flow",
-                "expert_nll": float(expert_nll),
-                "pit_mean": float(pit_mean),
-                "pit_std": float(pit_std),
-
-                # summary stats
-                "risk_mean": float(np.mean(risk_prob)),
-                "risk_p95": float(np.quantile(risk_prob, 0.95)),
-                "p_gate_mean": float(np.mean(p_gate)),
-                "p_event_mean": float(np.mean(p_event)),
-
-                # new diags
-                "gate_event_threshold_curve": gate_curve,
-                "gate_thr_for_target_recall": thr_for_target,
-                "ttc_bin_diag": bin_rows,
-                "flow_diag": diag_stats,
-            }
-
-            # save per tau
-            if not args.no_save:
-                tau_tag = f"_tau{tau_val:g}" if sweep_mode else ""
-                out_json = out_base / f"diag_{args.split}_{args.label_mode}{tau_tag}.json"
-                out_json.write_text(json.dumps(res, indent=2), encoding="utf-8")
-
-                if args.save_preds:
-                    seg_id = df_t["segment_id"].astype(str).to_numpy()
-                    frame = pd.to_numeric(df_t["frame_label"], errors="coerce").fillna(-1).to_numpy(np.int64)
-                    out_npz = out_base / f"preds_{args.split}_{args.label_mode}{tau_tag}.npz"
-                    np.savez_compressed(
-                        out_npz,
-                        segment_id=seg_id,
-                        frame_label=frame,
-                        y_gate=y_gate_true.astype(np.int8),
-                        y_event=y_event.astype(np.int8),
-                        p_gate=p_gate.astype(np.float32),
-                        p_event=p_event.astype(np.float32),
-                        risk=risk_prob.astype(np.float32),
-                    )
-
-            key = f"{str(run_dir)}::tau={tau_val:g}" if sweep_mode else str(run_dir)
-            all_results[key] = res
-
-            sweep_table.append(
-                {
-                    "run_name": run_dir.name,
-                    "split": args.split,
-                    "tau": float(tau_val),
-                    "pos_rate": float(np.mean(y_event)),
-                    "risk_pr_auc": res["risk_pr_auc"],
-                    "risk_brier": res["risk_brier"],
-                    "risk_ece": res["risk_ece"],
-                    "p_gate_mean": res["p_gate_mean"],
-                    "p_event_mean": res["p_event_mean"],
-                    "gate_thr_for_target_recall": res["gate_thr_for_target_recall"],
-                }
-            )
-
-            thr_s = f"{thr_for_target:.3f}" if (thr_for_target is not None and np.isfinite(thr_for_target)) else "NA"
-            print(
-                f"[OK] {run_dir.name} split={args.split} tau={tau_val:g} "
-                f"pos={res['pos_rate']:.4f} PR-AUC={res['risk_pr_auc']:.4f} "
-                f"Brier={res['risk_brier']:.4f} p_gate_mean={res['p_gate_mean']:.3f} "
-                f"p_event_mean={res['p_event_mean']:.3f} gate_thr@recall{args.gate_target_recall:.2f}={thr_s}"
-            )
-
-        # save sweep csv
-        if not args.no_save:
-            csv_path = out_base / f"tau_sweep_{args.split}_{args.label_mode}.csv"
-            pd.DataFrame(sweep_table).to_csv(csv_path, index=False)
-
-        summary_rows.extend(sweep_table)
-
-    print("\n===== SUMMARY (per run,tau) =====")
-    if summary_rows:
-        df_sum = pd.DataFrame(summary_rows)
-        print(df_sum.sort_values(["run_name", "tau"]).to_string(index=False))
+    if rows:
+        s = pd.DataFrame(rows)
+        s_path = os.path.join(args.out_dir, f"summary_{run_dir.name}_{args.split}.csv")
+        s.to_csv(s_path, index=False)
+        print("Saved summary:", s_path)
 
 
 if __name__ == "__main__":

@@ -78,7 +78,7 @@ def _match_cols_by_regex(colnames: List[str], patterns: List[str]) -> List[str]:
 
 
 from risk_pipeline.schema import build_schema_from_columns, save_schema
-from risk_pipeline.preprocess import build_preprocess_state, transform_dataframe, save_preprocess_state
+from risk_pipeline.preprocess import build_preprocess_state, transform_dataframe, save_preprocess_state, GateLabelConfig
 from risk_pipeline.data import RiskCSVDataset, SegmentBalancedBatchSampler, SegmentBalancedPosBatchSampler, make_dataloader
 from risk_pipeline.warp import RawWarpConfig
 from risk_pipeline.models import GateMLP, ConditionalSpline1DFlow
@@ -109,6 +109,18 @@ def main():
     ap.add_argument("--steps_per_epoch", type=int, default=200)
     ap.add_argument("--ttc_floor", type=float, default=0.05)
     ap.add_argument("--ttc_cap", type=float, default=10.0)
+    ap.add_argument("--schema_profile", type=str, default="minimal_v2", choices=["auto","minimal_v2"],
+                    help="Which feature-role schema to use. minimal_v2 enforces disjoint Gate/Expert features.")
+    ap.add_argument("--gate_candidate_range_m", type=float, default=50.0,
+                    help="Gate-label (proxy) parameter: candidate range threshold (meters).")
+    ap.add_argument("--gate_closing_thr_mps", type=float, default=0.5,
+                    help="Gate-label (proxy) parameter: closing speed threshold (m/s).")
+    ap.add_argument("--gate_ttc_max_s", type=float, default=8.0,
+                    help="Gate-label (proxy) parameter: TTC estimate threshold (seconds).")
+    ap.add_argument("--warp_p", type=float, default=0.35, help="Raw-space warp probability on gate negatives.")
+    ap.add_argument("--warp_speed_scale_min", type=float, default=1.05)
+    ap.add_argument("--warp_speed_scale_max", type=float, default=1.25)
+
     ap.add_argument("--dropout", type=float, default=0.2, help="Callback dropout rate")
     ap.add_argument("--hidden", type=int, default=64, help="Model hidden dim")
     ap.add_argument("--depth", type=int, default=2, help="Model depth")
@@ -152,28 +164,6 @@ def main():
                     help="Comma-separated regex. Matching x__* columns will be renamed to c__* (role remap without re-export).")
     ap.add_argument("--expert_drop_feature_regex", type=str, default="",
                     help="Comma-separated regex. Matching expert feature columns will be hard-dropped (set to train-mean) for flow, in both train+eval.")
-    ap.add_argument(
-        "--flow_feature_split",
-        type=str,
-        default="none",
-        choices=["none", "auto"],
-        help=(
-            "How to split Expert features into (x_part, c_cond) for Flow conditioning. "
-            "'none' keeps legacy behavior (all expert features as one concat condition). "
-            "'auto' sets c_cond = all c__* plus selected x__ (near/dist/lidar/occlusion/density/closing-speed proxies)."
-        ),
-    )
-    ap.add_argument(
-        "--flow_cond_mode",
-        type=str,
-        default="concat",
-        choices=["concat", "film"],
-        help=(
-            "How to inject conditioning into the Flow. 'concat' = legacy MLP on concatenated condition. "
-            "'film' = FiLM conditioning inside coupling network (strong c_cond injection)."
-        ),
-    )
-
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
@@ -214,7 +204,7 @@ def main():
         json.dump(split_map, f, indent=2)
 
     # 1) Schema is inferred from CSV headers.
-    schema0 = build_schema_from_columns(df_train.columns, context_mode=args.context_mode, flow_feature_split=args.flow_feature_split)
+    schema0 = build_schema_from_columns(df_train.columns, context_mode=args.context_mode, schema_profile=args.schema_profile)
     if (len(schema0.x_gate_cont) + len(schema0.x_gate_bin) + len(schema0.x_gate_onehot)) == 0:
         raise RuntimeError(
             "Schema matched zero features. Check x__/c__ prefixes and that ODD one-hot columns look like c__odd_weather=Rain."
@@ -222,7 +212,17 @@ def main():
 
     # 2) Preprocess state *prunes* the schema by variance-filter (Train-only) and
     #    learns scaler + target standardization.
-    state = build_preprocess_state(df_train, schema0, ttc_floor=args.ttc_floor, ttc_cap=args.ttc_cap)
+    state = build_preprocess_state(
+        df_train,
+        schema0,
+        ttc_floor=args.ttc_floor,
+        ttc_cap=args.ttc_cap,
+        gate_label_cfg=GateLabelConfig(
+            candidate_range_m=args.gate_candidate_range_m,
+            closing_thr_mps=args.gate_closing_thr_mps,
+            ttc_max_s=args.gate_ttc_max_s,
+        ),
+    )
     save_schema(state.schema, str(out / "feature_schema.json"))
     save_preprocess_state(state, str(out / "preprocess_state.json"))
 
@@ -303,7 +303,14 @@ def main():
     # --- Gate Training ---
     gate = GateMLP(ds_train.tensors.x_gate_raw.shape[1], hidden=args.hidden, depth=args.depth, dropout=args.dropout).to(device)
     feature_index = ds_train.gate_feature_index
-    warp_cfg = RawWarpConfig()
+    warp_cfg = RawWarpConfig(
+        p_warp=args.warp_p,
+        speed_scale_min=args.warp_speed_scale_min,
+        speed_scale_max=args.warp_speed_scale_max,
+        candidate_range_m=args.gate_candidate_range_m,
+        closing_thr_mps=args.gate_closing_thr_mps,
+        ttc_max_s=args.gate_ttc_max_s,
+    )
     
     optimizer = torch.optim.AdamW(gate.parameters(), lr=cfg.gate_lr, weight_decay=cfg.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True)
@@ -329,17 +336,7 @@ def main():
                 break
 
     # --- Expert Training ---
-    if args.flow_cond_mode == "concat":
-        flow = ConditionalSpline1DFlow(cond_dim=ds_train.tensors.x_expert_raw.shape[1], hidden=args.hidden, depth=args.depth, dropout=args.dropout).to(device)
-    else:
-        x_dim = len(getattr(state, "flow_x_idx", []) or [])
-        c_dim = len(getattr(state, "flow_c_idx", []) or [])
-        if c_dim <= 0:
-            raise RuntimeError("flow_cond_mode=film requires c_dim>0. Use --flow_feature_split auto and/or provide c__ features.")
-        if x_dim <= 0:
-            raise RuntimeError("flow_cond_mode=film requires x_dim>0 (non-context features).")
-        flow = ConditionalSpline1DFlow(cond_mode="film", x_dim=x_dim, c_dim=c_dim, hidden=args.hidden, depth=args.depth, dropout=args.dropout).to(device)
-        print(f"[Flow FiLM] x_dim={x_dim} c_dim={c_dim} (flow_c_cols={len(getattr(state, 'flow_c_cols', []))})")
+    flow = ConditionalSpline1DFlow(cond_dim=ds_train.tensors.x_expert_raw.shape[1], hidden=args.hidden, depth=args.depth, dropout=args.dropout).to(device)
 
     # Expert fingerprint guard: optionally drop c__ continuous segment-stat features (set to train mean => scaled 0)
     expert_colnames = ds_train.get_x_expert_colnames()
@@ -391,10 +388,8 @@ def main():
             drop_idx=drop_idx_t,
             ctx_all_idx=ctx_all_idx_t,
             ctx_block_drop_prob=args.expert_ctx_block_drop_prob,
-            flow_x_idx=getattr(state, 'flow_x_idx', None),
-            flow_c_idx=getattr(state, 'flow_c_idx', None),
         )
-        va = eval_expert_raw(flow, expert_val_loader, device, expert_mean, expert_std, drop_idx=drop_idx_t, flow_x_idx=getattr(state,'flow_x_idx',None), flow_c_idx=getattr(state,'flow_c_idx',None))
+        va = eval_expert_raw(flow, expert_val_loader, device, expert_mean, expert_std, drop_idx=drop_idx_t)
         scheduler.step(va)
         
         print(f"[Expert] epoch {ep+1}/{cfg.expert_epochs} train_nll={tr:.4f} val_nll={va:.4f} lr={optimizer.param_groups[0]['lr']:.2e}")
@@ -426,8 +421,7 @@ def main():
     logits = gate(xg)
 
     rcfg = RiskConfig(tau=0.7, a_max=6.0, ttc_floor=args.ttc_floor, ttc_cap=args.ttc_cap)
-    xe_cond = (xe[:, state.flow_x_idx], xe[:, state.flow_c_idx]) if (flow.expects_tuple_condition() if callable(getattr(flow, 'expects_tuple_condition', None)) else bool(getattr(flow, 'expects_tuple_condition', False))) else xe
-    risk, p_gate = compute_risk(logits, flow, xe_cond, v_close, state.target_std, rcfg)
+    risk, p_gate = compute_risk(logits, flow, xe, v_close, state.target_std, rcfg)
 
     stats = {
         "risk_mean": float(risk.mean().item()),

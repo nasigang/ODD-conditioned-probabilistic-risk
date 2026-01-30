@@ -103,11 +103,10 @@ class RiskCSVDataset(Dataset):
         x_expert_cols = self.x_expert_cols
 
         # --- Raw (unscaled) features ---
-        # IMPORTANT: x_expert_cols is defined as (x_gate_cols + expert_extra_cols).
-        # We materialize ONLY the expert matrix and take x_gate_raw as a view to
-        # avoid duplicating memory.
+        # v2: Gate and Expert inputs are *disjoint* by design.
+        # v1: x_expert_cols may include gate columns; this still works (expert will see them).
+        x_gate_raw = torch.tensor(self.df[x_gate_cols].to_numpy(np.float32), dtype=torch.float32)
         x_expert_raw = torch.tensor(self.df[x_expert_cols].to_numpy(np.float32), dtype=torch.float32)
-        x_gate_raw = x_expert_raw[:, : len(x_gate_cols)]
 
         # --- Targets / masks ---
         y_gate = torch.tensor(self.df["y_gate"].to_numpy(np.float32), dtype=torch.float32)
@@ -141,7 +140,7 @@ class RiskCSVDataset(Dataset):
         # Identify samples where TTC was clipped to ttc_cap (right-censored).
         # y_expert = (log(ttc) - mu) / sigma
         # y_censored = (log(ttc_cap) - mu) / sigma
-        y_c_val = (np.log(self.ttc_cap + 1e-9) - self.state.target_std.mu_y) / (self.state.target_std.sigma_y + 1e-6)
+        y_c_val = (np.log(self.ttc_cap + 1e-9) - getattr(self.state.target_std, 'mu_y', getattr(self.state.target_std, 'mean'))) / (getattr(self.state.target_std, 'sigma_y', getattr(self.state.target_std, 'std')) + 1e-6)
         # Use a small epsilon for float comparison safety
         censored_mask = (y_expert >= (y_c_val - 1e-4)).float()
 

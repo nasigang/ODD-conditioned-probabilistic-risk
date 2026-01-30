@@ -396,11 +396,83 @@ def _infer_flow_hparams_from_sd(flow_sd: Dict[str, torch.Tensor]) -> Tuple[int, 
 
 
 
-def _infer_flow_arch_and_hparams_from_sd_by_shape(flow_sd: Dict[str, torch.Tensor], *, x_dim: int, c_dim: int, cond_dim: int) -> Tuple[str, int, int, int]:
-    """Infer (cond_mode, hidden, depth, num_bins) from a Flow state_dict using only tensor shapes.
 
-    Robust to checkpoint key naming differences (Sequential vs ModuleList, etc.).
+def _infer_flow_arch_and_hparams_from_sd_by_shape(flow_sd: Dict[str, torch.Tensor], *, x_dim: int, c_dim: int, cond_dim: int) -> Tuple[str, int, int, int, int, int]:
+    """Infer (cond_mode, hidden, depth, num_bins, inferred_x_dim, inferred_c_dim) from a Flow state_dict.
+
+    IMPORTANT:
+    - Do NOT rely on schema-provided dims; those may be missing/old.
+    - Prefer explicit module keys if present (trunk/film/head), otherwise fall back to shape heuristics.
     """
+    # --- Fast path 0: concat-style Sequential net keys present ---
+    # In our implementation, concat-mode Flow parameters are stored under net.{i}.weight.
+    # IMPORTANT: do NOT try to infer head out_dim by "largest (o-1)%3==0" globally,
+    # because hidden layers like (64,64) also satisfy that predicate and can be larger
+    # than the true head out_dim (e.g., 49). Instead, use the LAST Linear in the net.
+    net_w = [(k, v) for k, v in flow_sd.items() if k.startswith("net.") and k.endswith(".weight") and getattr(v, "ndim", 0) == 2]
+    if net_w:
+        def _idx(key: str) -> int:
+            try:
+                return int(key.split(".")[1])
+            except Exception:
+                return -1
+
+        net_w.sort(key=lambda kv: _idx(kv[0]))
+        w0 = net_w[0][1]
+        hidden = int(w0.shape[0])
+        inferred_cond = int(w0.shape[1])
+
+        last_w = net_w[-1][1]
+        out_dim = int(last_w.shape[0])
+        num_bins = int((out_dim - 1) // 3)
+        if (3 * num_bins + 1) != out_dim:
+            raise RuntimeError(f"[flow] concat head out_dim={out_dim} not compatible with num_bins (expected 3K+1).")
+
+        # depth: number of Linear layers excluding head
+        idxs = []
+        for k, _ in net_w:
+            i = _idx(k)
+            if i >= 0:
+                idxs.append(i)
+        depth = max(1, len(set(idxs)) - 1)
+        return "concat", hidden, depth, num_bins, inferred_cond, 0
+
+    # --- Fast path 1: explicit FiLM-style keys present ---
+    has_trunk = any(k.startswith("trunk.") and k.endswith(".weight") for k in flow_sd.keys())
+    has_film  = any(k.startswith("film.") and k.endswith(".weight") for k in flow_sd.keys())
+    has_head  = any(k == "head.weight" or (k.startswith("head.") and k.endswith(".weight")) for k in flow_sd.keys())
+
+    if has_trunk and has_film and has_head:
+        # trunk.0.weight: (hidden, x_dim)
+        # film.0.weight:  (2*hidden, c_dim)
+        # head.weight:    (3K+1, hidden)
+        trunk0 = flow_sd[[k for k in flow_sd.keys() if k == "trunk.0.weight"][0]]
+        film0  = flow_sd[[k for k in flow_sd.keys() if k == "film.0.weight"][0]]
+        # head weight key can be 'head.weight' or 'head.0.weight' depending on impl
+        head_key = "head.weight" if "head.weight" in flow_sd else [k for k in flow_sd.keys() if k.startswith("head.") and k.endswith(".weight")][0]
+        headw = flow_sd[head_key]
+
+        hidden = int(trunk0.shape[0])
+        inferred_x = int(trunk0.shape[1])
+        inferred_c = int(film0.shape[1])
+
+        out_dim = int(headw.shape[0])
+        num_bins = int((out_dim - 1) // 3)
+        if (3 * num_bins + 1) != out_dim:
+            raise RuntimeError(f"[flow] head out_dim={out_dim} not compatible with num_bins (expected 3K+1).")
+
+        # depth: count trunk.{i}.weight blocks with out=hidden
+        trunk_weights = [k for k in flow_sd.keys() if k.startswith("trunk.") and k.endswith(".weight")]
+        # Only count Linear layers (2D weights) that map into hidden
+        depth = 0
+        for k in trunk_weights:
+            w = flow_sd[k]
+            if getattr(w, "ndim", 0) == 2 and int(w.shape[0]) == hidden:
+                depth += 1
+        depth = max(1, depth)
+        return "film", hidden, depth, num_bins, inferred_x, inferred_c
+
+    # --- Generic shape-based inference (concat or FiLM without explicit names) ---
     mats = []
     for k, v in flow_sd.items():
         if k.endswith("weight") and getattr(v, "ndim", 0) == 2:
@@ -416,38 +488,33 @@ def _infer_flow_arch_and_hparams_from_sd_by_shape(flow_sd: Dict[str, torch.Tenso
     out_dim, out_key = max(out_cands, key=lambda t: t[0])
     num_bins = int((out_dim - 1) // 3)
 
-    # concat: first layer (hidden, cond_dim), head (out_dim, hidden)
-    concat_first = [(k, o, i) for (k, o, i) in mats if i == int(cond_dim) and o != out_dim]
+    # Try infer hidden from a likely "head" mapping to out_dim
+    head_cands = [(k, o, i) for (k, o, i) in mats if o == out_dim and i >= 8]
+    if not head_cands:
+        raise RuntimeError("Could not infer hidden: no head weight (out_dim, hidden) found.")
+    hidden = int(max(head_cands, key=lambda t: t[2])[2])
+
+    # Concat: there should exist a first layer (hidden, cond_dim)
+    concat_first = [(k, o, i) for (k, o, i) in mats if o == hidden and i == int(cond_dim)]
     if concat_first:
-        hidden = int(sorted([o for _, o, _ in concat_first])[0])
+        # depth: count (hidden, *) layers excluding head
         trunk = [(k, o, i) for (k, o, i) in mats if o == hidden and i in {int(cond_dim), hidden}]
-        depth = max(1, int(len(trunk)))
-        head_ok = any((o == out_dim and i == hidden) for _, o, i in mats)
-        if head_ok:
-            return "concat", hidden, depth, num_bins
+        depth = max(1, len(trunk))
+        return "concat", hidden, depth, num_bins, int(cond_dim), 0
 
-    # film: trunk has (hidden, x_dim), film has (2*hidden, c_dim), head has (out_dim, hidden)
-    film_hiddens = sorted({int(o) for (k, o, i) in mats if i == int(x_dim) and o != out_dim}, reverse=True)
-    for hidden in film_hiddens:
-        head_ok = any((o == out_dim and i == hidden) for _, o, i in mats)
-        if not head_ok:
-            continue
-        trunk = [(k, o, i) for (k, o, i) in mats if o == hidden and i in {int(x_dim), hidden}]
-        if not trunk:
-            continue
-        depth = max(1, int(len(trunk)))
-        if int(c_dim) > 0:
-            film = [(k, o, i) for (k, o, i) in mats if i == int(c_dim) and o == int(2 * hidden)]
-            if not film:
-                continue
-        return "film", hidden, depth, num_bins
+    # FiLM: infer x_dim as any input dimension of a (hidden, x_dim) layer that is NOT cond_dim
+    # Pick the largest candidate < cond_dim to avoid selecting hidden->hidden.
+    x_cands = sorted({i for (k, o, i) in mats if o == hidden and i not in {hidden, cond_dim}}, reverse=True)
+    inferred_x = int(x_cands[0]) if x_cands else int(x_dim)
 
-    sample="\n".join([f"{k}:({o},{i})" for k,o,i in mats[:25]])
-    raise RuntimeError(
-        "Could not infer Flow architecture from checkpoint shapes. "
-        f"(x_dim={x_dim}, c_dim={c_dim}, cond_dim={cond_dim}, out_dim={out_dim} from {out_key})\n"
-        f"Sample weights:\n{sample}"
-    )
+    # infer c_dim from any (2*hidden, c_dim) layer, prefer explicit 2*hidden out
+    c_cands = sorted({i for (k, o, i) in mats if o == 2 * hidden and i not in {hidden, cond_dim}}, reverse=True)
+    inferred_c = int(c_cands[0]) if c_cands else int(c_dim)
+
+    # depth: count trunk-like layers (hidden, inferred_x or hidden)
+    trunk = [(k, o, i) for (k, o, i) in mats if o == hidden and i in {inferred_x, hidden}]
+    depth = max(1, len(trunk))
+    return "film", hidden, depth, num_bins, inferred_x, inferred_c
 
 
 def load_models_for_run(run_dir: Path, state, device: torch.device):
@@ -485,9 +552,24 @@ def load_models_for_run(run_dir: Path, state, device: torch.device):
         c_dim = int(len(flow_c_cols))
         cond_dim = int(len(expert_cols))
 
-        cond_mode, f_hidden, f_depth, num_bins = _infer_flow_arch_and_hparams_from_sd_by_shape(
+        cond_mode, f_hidden, f_depth, num_bins, inf_x_dim, inf_c_dim = _infer_flow_arch_and_hparams_from_sd_by_shape(
             flow_sd, x_dim=x_dim, c_dim=c_dim, cond_dim=cond_dim
         )
+
+        # If schema lacks flow_x/flow_c (common when loading older schema), fall back to splitting by inferred dims.
+        if (x_dim == cond_dim and c_dim == 0) and (inf_c_dim > 0) and (inf_x_dim + inf_c_dim == cond_dim):
+            print(f"[flow] schema has no flow split (x_dim==cond_dim, c_dim==0). Using inferred split: x={inf_x_dim}, c={inf_c_dim}.")
+            x_dim, c_dim = int(inf_x_dim), int(inf_c_dim)
+            # Assume expert column order is [x..., c...]
+            flow_x_cols = list(expert_cols)[:x_dim]
+            flow_c_cols = list(expert_cols)[x_dim:x_dim + c_dim]
+        else:
+            # Prefer schema split, but sanity check against inferred
+            if (inf_x_dim > 0 and inf_c_dim >= 0) and (x_dim + c_dim == cond_dim) and (inf_x_dim + inf_c_dim == cond_dim):
+                if (x_dim != inf_x_dim) or (c_dim != inf_c_dim):
+                    print(f"[flow][warn] schema split (x={x_dim}, c={c_dim}) != inferred split (x={inf_x_dim}, c={inf_c_dim}). Using schema split.")
+            # else: keep schema
+
         print(f"[flow] inferred cond_mode={cond_mode} hidden={f_hidden} depth={f_depth} num_bins={num_bins} (x_dim={x_dim}, c_dim={c_dim}, cond_dim={cond_dim})")
 
         if cond_mode == "concat":
@@ -512,6 +594,16 @@ def load_models_for_run(run_dir: Path, state, device: torch.device):
 
         expert.load_state_dict(flow_sd, strict=True)
         expert.eval()
+        # Attach inferred flow meta for downstream inference (FiLM split fallback)
+        try:
+            expert._cond_mode = cond_mode
+            expert._x_dim = int(x_dim)
+            expert._c_dim = int(c_dim)
+            expert._cond_dim = int(cond_dim)
+            expert._flow_x_cols = list(flow_x_cols)
+            expert._flow_c_cols = list(flow_c_cols)
+        except Exception:
+            pass
         return gate, expert, "flow"
 
     # Gaussian expert support (only if your codebase provides it)
@@ -866,6 +958,22 @@ def main():
         # load models
         gate, expert, expert_type = load_models_for_run(run_dir, state, device=device)
 
+        # If this is a FiLM Flow and schema didn't provide explicit split indices, fall back to inferred dims/cols.
+        if expert_type == "flow":
+            cond_mode = getattr(expert, "_cond_mode", None)
+            if cond_mode == "film" and (flow_x_idx_t is None or flow_c_idx_t is None):
+                expert_colnames = ds.get_x_expert_colnames()
+                x_dim = int(getattr(expert, "_x_dim", 0))
+                c_dim = int(getattr(expert, "_c_dim", 0))
+                if x_dim <= 0 or c_dim < 0 or (x_dim + c_dim) != len(expert_colnames):
+                    raise RuntimeError(
+                        f"Flow is in FiLM mode but cannot build flow_x_idx/flow_c_idx: "
+                        f"x_dim={x_dim}, c_dim={c_dim}, len(expert_cols)={len(expert_colnames)}"
+                    )
+                flow_x_idx_t = torch.tensor(list(range(x_dim)), dtype=torch.long)
+                flow_c_idx_t = torch.tensor(list(range(x_dim, x_dim + c_dim)), dtype=torch.long)
+                print(f"[flow] built fallback split indices for FiLM: x={x_dim}, c={c_dim}")
+
         # labels
         y_gate_true = ds.tensors.y_gate.detach().cpu().numpy().astype(np.int64)
         y_event = build_event_label(
@@ -893,8 +1001,8 @@ def main():
         )
         thr_ttc = np.clip(thr_ttc, args.ttc_floor, args.ttc_cap)
         thr_log = np.log(thr_ttc + 1e-9)
-        mu_y = float(state.target_std.mu_y)
-        sig_y = float(state.target_std.sigma_y)
+        mu_y = float(getattr(state.target_std, 'mu_y', getattr(state.target_std, 'mean')))
+        sig_y = float(getattr(state.target_std, 'sigma_y', getattr(state.target_std, 'std')))
         eps_y = float(getattr(state.target_std, "eps", 1e-6))
         y_thr_std = (thr_log - mu_y) / (sig_y + eps_y)
         y_thr_std_t = torch.tensor(y_thr_std, dtype=torch.float32)
