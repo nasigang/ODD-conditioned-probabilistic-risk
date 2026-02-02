@@ -25,6 +25,103 @@ import torch
 import re
 from typing import Dict, List, Tuple, Iterable
 
+
+def gate_threshold_for_target_recall(
+    p_gate: np.ndarray,
+    y_true: np.ndarray,
+    target_recall: float,
+) -> float:
+    """Compute a gate threshold achieving at least target recall on positives.
+
+    We use the empirical (1-target_recall) quantile of p_gate over y_true==1.
+    This avoids dependence on a pre-defined threshold grid.
+    """
+    target_recall = float(np.clip(target_recall, 0.0, 1.0))
+    pos = (y_true > 0.5)
+    if pos.sum() == 0:
+        return 1.0
+    scores = p_gate[pos]
+    # For recall=r, keep the top r fraction of positives => threshold at q=(1-r).
+    q = max(0.0, 1.0 - target_recall)
+    thr = float(np.quantile(scores, q))
+    # guard against numerical weirdness
+    if not np.isfinite(thr):
+        thr = 1.0
+    return float(np.clip(thr, 0.0, 1.0))
+
+
+@torch.no_grad()
+def compute_sigma_log_from_flow(
+    expert,
+    cond,
+    mu_y: float,
+    sigma_y: float,
+    num_samples: int,
+    batch_size: int = 4096,
+) -> np.ndarray:
+    """Estimate per-sample uncertainty in logTTC space via sampling.
+
+    Returns
+    -------
+    sigma_log : [N] numpy array, where sigma_log is std(logTTC) for each row.
+
+    Implementation detail:
+    We sample y_std (standardized logTTC) from the flow, then
+    sigma_log = std(y_std) * sigma_y.
+    """
+    if num_samples <= 0:
+        raise ValueError("num_samples must be > 0")
+
+    # cond can be Tensor or tuple(Tensor, Tensor) (FiLM)
+    def _slice_cond(c, sl):
+        if isinstance(c, (tuple, list)):
+            return tuple(_slice_cond(x, sl) for x in c)
+        return c[sl]
+
+    # determine N
+    if isinstance(cond, (tuple, list)):
+        N = int(cond[0].shape[0])
+    else:
+        N = int(cond.shape[0])
+
+    out = np.zeros((N,), dtype=np.float32)
+    for s in range(0, N, batch_size):
+        e = min(N, s + batch_size)
+        c_b = _slice_cond(cond, slice(s, e))
+        # y_std: [B, S]
+        y_std = expert.sample(c_b, num_samples=num_samples)
+        # std over samples in standardized space
+        sig_std = y_std.float().std(dim=1, unbiased=False)
+        out[s:e] = (sig_std * float(sigma_y)).cpu().numpy().astype(np.float32)
+    return out
+
+
+@torch.no_grad()
+def compute_sigma_log_from_flow_samples(
+    expert,
+    cond,
+    sigma_y: float,
+    num_samples: int,
+    batch: int = 2048,
+) -> np.ndarray:
+    """Estimate per-sample sigma_log (std in logTTC space) using flow sampling.
+
+    expert.sample(cond, S) must return samples in *standardized* y-space.
+    sigma_log = std(y_std)*sigma_y.
+    """
+    if num_samples <= 0:
+        raise ValueError("num_samples must be > 0")
+    sigma_y = float(sigma_y)
+    n = cond.shape[0] if hasattr(cond, "shape") else cond[0].shape[0]
+    out = np.zeros((n,), dtype=np.float32)
+    for s in range(0, n, batch):
+        e = min(n, s + batch)
+        c_b = cond[s:e] if hasattr(cond, "shape") else (cond[0][s:e], cond[1][s:e])
+        y_samp = expert.sample(c_b, num_samples=num_samples)  # [B, S]
+        sig = torch.std(y_samp, dim=1, unbiased=False) * sigma_y
+        out[s:e] = sig.detach().cpu().numpy().astype(np.float32)
+    return out
+
 def _parse_csv_list(s: str) -> List[str]:
     if not s:
         return []
@@ -734,6 +831,73 @@ def infer_flow_cdf_probs(
     return out
 
 
+@torch.no_grad()
+def infer_flow_sigma_log(
+    flow,
+    x_ctx_raw: torch.Tensor,          # [N, C] raw (expert ordering)
+    expert_mean: torch.Tensor,
+    expert_std: torch.Tensor,
+    *,
+    drop_idx: Optional[torch.Tensor],
+    flow_x_idx: Optional[torch.Tensor],
+    flow_c_idx: Optional[torch.Tensor],
+    device: torch.device,
+    batch: int,
+    num_samples: int,
+    y_log_sigma: float,
+) -> np.ndarray:
+    """Estimate per-sample uncertainty sigma in logTTC space.
+
+    Returns
+    -------
+    sigma_log : np.ndarray [N]
+        Standard deviation of logTTC implied by the learned Flow, estimated by sampling.
+    """
+    if num_samples <= 0:
+        raise ValueError("num_samples must be > 0")
+
+    n = x_ctx_raw.shape[0]
+    out = np.empty((n,), dtype=np.float32)
+    flow.eval()
+
+    expert_mean = expert_mean.to(device)
+    expert_std = expert_std.to(device)
+    if drop_idx is not None and drop_idx.numel() > 0:
+        drop_idx = drop_idx.to(device)
+    if flow_x_idx is not None:
+        flow_x_idx = flow_x_idx.to(device)
+    if flow_c_idx is not None:
+        flow_c_idx = flow_c_idx.to(device)
+
+    film_mode = bool(getattr(flow, "expects_tuple_condition", lambda: False)())
+
+    for i0 in range(0, n, batch):
+        i1 = min(n, i0 + batch)
+        xe_raw = x_ctx_raw[i0:i1].to(device)
+
+        if drop_idx is not None and drop_idx.numel() > 0:
+            xe_raw = xe_raw.clone()
+            xe_raw[:, drop_idx] = expert_mean[drop_idx]
+
+        xe = (xe_raw - expert_mean) / (expert_std + 1e-6)
+
+        if film_mode:
+            if flow_x_idx is None or flow_c_idx is None:
+                raise RuntimeError("Flow is in FiLM mode but flow_x_idx/flow_c_idx were not provided.")
+            x_part = xe.index_select(1, flow_x_idx)
+            c_part = xe.index_select(1, flow_c_idx) if int(flow_c_idx.numel()) > 0 else xe[:, :0]
+            cond = (x_part, c_part)
+        else:
+            cond = xe
+
+        ys = flow.sample(cond, num_samples=num_samples)  # [B, S] in standardized logTTC
+        sig_std = ys.std(dim=1, unbiased=False)
+        sig_log = sig_std * float(y_log_sigma)
+        out[i0:i1] = sig_log.float().detach().cpu().numpy()
+
+    return out
+
+
 
 @torch.no_grad()
 def eval_flow_nll_and_pit(
@@ -883,6 +1047,15 @@ def main():
 
     # performance / output
     ap.add_argument("--batch", type=int, default=4096)
+    # Strategy A: Uncertainty (σ_log) via Flow sampling in logTTC space
+    ap.add_argument("--uncertainty_samples", type=int, default=0,
+                    help="If >0, draw this many samples per point from the Flow and report σ_log (std in logTTC space).")
+    ap.add_argument("--uncertainty_scope", type=str, default="both", choices=["all", "gated", "both"],
+                    help="Compute σ_log for all points, gate-passed points, or both. (We compute per-point σ_log once; scope affects reporting/subsetting.)")
+    ap.add_argument("--gate_target_recall", type=float, default=0.90,
+                    help="When gating is needed for σ_log reporting, compute an automatic threshold to reach this recall on positives.")
+    ap.add_argument("--gate_threshold", type=float, default=None,
+                    help="Optional fixed gate threshold for σ_log gating. If omitted, uses --gate_target_recall.")
     ap.add_argument("--save_dir", default=None, help="If set, save outputs here under <save_dir>/<run_name>/ ...")
     ap.add_argument("--save_preds", action="store_true", help="Also save per-sample preds (.npz)")
     ap.add_argument("--no_save", action="store_true", help="Disable saving json/csv")
@@ -1032,6 +1205,35 @@ def main():
                 batch=args.batch,
             )
 
+            # Strategy A: uncertainty σ_log (std in logTTC space) via sampling
+            sigma_log = None
+            gate_thr_for_sigma = None
+            if int(args.uncertainty_samples) > 0:
+                sigma_log = infer_flow_sigma_log(
+                    expert,
+                    ds.tensors.x_expert_raw,
+                    expert_mean,
+                    expert_std,
+                    drop_idx=drop_idx_t,
+                    flow_x_idx=flow_x_idx_t,
+                    flow_c_idx=flow_c_idx_t,
+                    mu_y=mu_y,
+                    sigma_y=sig_y,
+                    num_samples=int(args.uncertainty_samples),
+                    device=device,
+                    batch=max(256, min(args.batch, 2048)),
+                )
+
+                # gate threshold used for "gate-pass" subset stats
+                if args.uncertainty_gate_threshold is not None:
+                    gate_thr_for_sigma = float(args.uncertainty_gate_threshold)
+                else:
+                    gate_thr_for_sigma = gate_threshold_for_target_recall(
+                        p_gate,
+                        y_event.astype(np.int64),
+                        float(args.gate_target_recall),
+                    )
+
             # expert nll + PIT on expert training subset
             expert_nll, pit_mean, pit_std = eval_flow_nll_and_pit(
                 expert,
@@ -1089,6 +1291,22 @@ def main():
             "p_gate_mean": float(np.mean(p_gate)),
             "p_event_mean": float(np.mean(p_event)),
         }
+
+        # Strategy A outputs
+        if "sigma_log" in locals() and sigma_log is not None:
+            gate_pass_auto = (p_gate >= float(gate_thr_for_sigma))
+            res.update(
+                {
+                    "uncertainty_samples": int(args.uncertainty_samples),
+                    "sigma_log_mean_all": float(np.mean(sigma_log)),
+                    "sigma_log_p95_all": float(np.quantile(sigma_log, 0.95)),
+                    "sigma_log_gate_thr": float(gate_thr_for_sigma),
+                    "sigma_log_mean_gate": float(np.mean(sigma_log[gate_pass_auto])) if int(np.sum(gate_pass_auto)) > 0 else float("nan"),
+                    "sigma_log_p95_gate": float(np.quantile(sigma_log[gate_pass_auto], 0.95)) if int(np.sum(gate_pass_auto)) > 0 else float("nan"),
+                    "gate_pass_auto_N": int(np.sum(gate_pass_auto)),
+                    "gate_pass_auto_pos_rate": float(np.mean(y_event[gate_pass_auto])) if int(np.sum(gate_pass_auto)) > 0 else float("nan"),
+                }
+            )
 
         # subgroup metrics (one-hot columns)
         subgroup = {}
@@ -1151,8 +1369,7 @@ def main():
                 seg_id = df_t["segment_id"].astype(str).to_numpy()
                 frame = pd.to_numeric(df_t["frame_label"], errors="coerce").fillna(-1).to_numpy(np.int64)
                 out_npz = out_dir / f"preds_{args.split}_{args.label_mode}.npz"
-                np.savez_compressed(
-                    out_npz,
+                npz_kwargs = dict(
                     segment_id=seg_id,
                     frame_label=frame,
                     y_gate=y_gate_true.astype(np.int8),
@@ -1161,6 +1378,10 @@ def main():
                     p_event=p_event.astype(np.float32),
                     risk=risk_prob.astype(np.float32),
                 )
+                if ("sigma_log" in locals() and sigma_log is not None):
+                    npz_kwargs["sigma_log"] = sigma_log.astype(np.float32)
+                    npz_kwargs["gate_thr_for_sigma"] = np.array([gate_thr_for_sigma], dtype=np.float32)
+                np.savez_compressed(out_npz, **npz_kwargs)
 
         all_results[str(run_dir)] = res
 

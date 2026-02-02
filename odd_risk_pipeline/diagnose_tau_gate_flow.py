@@ -28,6 +28,7 @@ import numpy as np
 import pandas as pd
 import torch
 import matplotlib.pyplot as plt
+from torch.distributions import Normal
 
 from risk_pipeline.preprocess import load_preprocess_state, transform_dataframe
 from risk_pipeline.data import RiskCSVDataset
@@ -125,6 +126,110 @@ def ece(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 15) -> float:
         conf = float(np.mean(y_prob[m]))
         out += float(np.mean(m)) * abs(acc - conf)
     return float(out)
+
+
+# -------------------------
+# Flow sampling uncertainty (Strategy A)
+# -------------------------
+
+@torch.no_grad()
+def infer_flow_sigma_log(
+    flow: ConditionalSpline1DFlow,
+    cond,
+    *,
+    target_mu: float,
+    target_sigma: float,
+    num_samples: int = 512,
+    batch: int = 1024,
+    device: torch.device,
+) -> np.ndarray:
+    """Per-sample uncertainty sigma in logTTC space via sampling.
+
+    Returns
+    -------
+    sigma_log : np.ndarray, shape [N]
+        std over sampled logTTC.
+    """
+
+    N = int(cond[0].shape[0]) if isinstance(cond, (tuple, list)) else int(cond.shape[0])
+    S = int(num_samples)
+    out = np.zeros((N,), dtype=np.float32)
+
+    mu = float(target_mu)
+    sig = float(target_sigma)
+
+    for i0 in range(0, N, int(batch)):
+        i1 = min(N, i0 + int(batch))
+        if isinstance(cond, (tuple, list)):
+            c_b = (cond[0][i0:i1], cond[1][i0:i1])
+        else:
+            c_b = cond[i0:i1]
+
+        y_s = flow.sample(c_b, num_samples=S)  # [B,S] in standardized logTTC
+        log_ttc_s = y_s * (sig + 1e-6) + mu
+        sigma_log_b = torch.std(log_ttc_s, dim=1, unbiased=False)
+        out[i0:i1] = sigma_log_b.detach().cpu().numpy().astype(np.float32)
+
+    return out
+
+
+# -------------------------
+# Subgroup splitting (Strategy B)
+# -------------------------
+
+def _make_bins(values: np.ndarray, method: str) -> List[Tuple[str, np.ndarray]]:
+    v = values.astype(np.float64)
+    finite = np.isfinite(v)
+    if finite.sum() < 20:
+        return [("all", finite.copy())]
+
+    if method == "median":
+        thr = float(np.nanmedian(v))
+        lo = finite & (v <= thr)
+        hi = finite & (v > thr)
+        if lo.sum() == 0 or hi.sum() == 0:
+            return [("all", finite.copy())]
+        return [("low", lo), ("high", hi)]
+
+    # quantile3
+    q1, q2 = np.nanquantile(v, [1.0 / 3.0, 2.0 / 3.0])
+    q1, q2 = float(q1), float(q2)
+    if not np.isfinite(q1) or not np.isfinite(q2) or q1 >= q2:
+        # fallback to median split if quantiles are degenerate
+        thr = float(np.nanmedian(v))
+        lo = finite & (v <= thr)
+        hi = finite & (v > thr)
+        if lo.sum() == 0 or hi.sum() == 0:
+            return [("all", finite.copy())]
+        return [("low", lo), ("high", hi)]
+
+    low = finite & (v <= q1)
+    mid = finite & (v > q1) & (v <= q2)
+    high = finite & (v > q2)
+    # guard: if any bucket is empty, fallback to median
+    if low.sum() == 0 or mid.sum() == 0 or high.sum() == 0:
+        thr = float(np.nanmedian(v))
+        lo = finite & (v <= thr)
+        hi = finite & (v > thr)
+        if lo.sum() == 0 or hi.sum() == 0:
+            return [("all", finite.copy())]
+        return [("low", lo), ("high", hi)]
+    return [("low", low), ("mid", mid), ("high", high)]
+
+
+def _get_feature_array(ds: RiskCSVDataset, feature: str) -> np.ndarray:
+    """Fetch raw feature values from dataset tensors by column name."""
+    g_cols = ds.get_x_gate_colnames()
+    if feature in g_cols:
+        j = g_cols.index(feature)
+        return ds.tensors.x_gate_raw[:, j].cpu().numpy().astype(np.float32)
+
+    e_cols = ds.get_x_expert_colnames()
+    if feature in e_cols:
+        j = e_cols.index(feature)
+        return ds.tensors.x_expert_raw[:, j].cpu().numpy().astype(np.float32)
+
+    raise KeyError(f"Feature not found in dataset tensors: {feature}")
 
 
 # -------------------------
@@ -313,23 +418,41 @@ def _make_event_label(
 
 
 def _choose_gate_thr_for_recall(p_gate: np.ndarray, y_true: np.ndarray, thresholds: List[float], target_recall: float) -> float:
+    """Return a gate threshold that achieves (approximately) the requested positive recall.
+
+    We compute the threshold directly from positive scores (not limited to a coarse grid),
+    and keep the previous grid-based scan only as a fallback when positives are too few.
+    """
     pos = (y_true > 0.5)
     P = int(np.sum(pos))
     if P <= 0:
         return float("nan")
-    best = None
-    for thr in sorted(thresholds):
-        pred = (p_gate >= thr)
-        tp = int(np.sum(pred & pos))
-        rec = tp / max(1, P)
-        if rec >= target_recall:
-            best = thr
-    if best is None:
-        best = float(min(thresholds)) if thresholds else float("nan")
-    return float(best)
+
+    # Direct (auto) threshold: pick the (1 - target_recall) quantile of positive scores.
+    # If we use p_gate >= thr, then setting thr to the k-th largest positive score yields recall k/P.
+    pos_scores = np.asarray(p_gate[pos], dtype=np.float64)
+    if pos_scores.size < 2:
+        # Too few positives: fallback to grid if provided.
+        return float(min(thresholds)) if thresholds else float("nan")
+
+    k = int(np.ceil(float(target_recall) * float(P)))
+    k = max(1, min(k, P))
+    # kth largest -> index P-k in ascending sorted array
+    pos_sorted = np.sort(pos_scores)
+    thr_auto = float(pos_sorted[P - k])
+
+    # Optional: if a threshold grid is provided, snap to the nearest lower/equal grid point
+    # so users can reproduce previously reported "gate_thresholds" tables.
+    if thresholds:
+        grid = np.array(sorted(thresholds), dtype=np.float64)
+        le = grid[grid <= thr_auto]
+        if le.size > 0:
+            return float(le[-1])
+    return thr_auto
 
 
 def _plot_pit(u: np.ndarray, out_path: str) -> Dict[str, float]:
+    # NOTE: this function expects PIT values in [0,1] (NOT latent u ~ N(0,1)).
     u = np.clip(u, 0.0, 1.0)
     plt.figure(figsize=(5, 4))
     plt.hist(u, bins=20, range=(0, 1), density=True)
@@ -528,6 +651,22 @@ def main():
     ap.add_argument("--expert_drop_feature_regex", type=str, default="")
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--max_rows", type=int, default=0)
+
+    # Strategy A: uncertainty in logTTC via sampling from the conditional flow
+    ap.add_argument("--uncertainty_samples", type=int, default=0,
+                    help="If >0, compute sigma_log (std of logTTC) via flow sampling with S samples (e.g., 512).")
+    ap.add_argument("--uncertainty_scope", choices=["all", "gated", "both"], default="both",
+                    help="Whether to report sigma_log summary on all val samples, gated samples, or both.")
+    ap.add_argument("--uncertainty_batch", type=int, default=1024,
+                    help="Batch size for flow sampling when computing sigma_log.")
+
+    # Strategy B: subgroup sensitivity analysis (difficulty proxies)
+    ap.add_argument("--subgroup_features", type=str, default="x__density,x__occlusion_low_points_ratio_dyn_30m",
+                    help="Comma-separated feature list for subgroup splits (e.g., x__density,x__occlusion_low_points_ratio_dyn_30m). Set empty to disable.")
+    ap.add_argument("--subgroup_split", choices=["median", "quantile3"], default="median",
+                    help="Split rule: 'median' -> 2 bins (low/high), 'quantile3' -> 3 bins (low/mid/high).")
+    ap.add_argument("--subgroup_on", choices=["all", "gated", "both"], default="both",
+                    help="Compute subgroup summaries on all samples, gated samples, or both.")
     args = ap.parse_args()
 
     run_dir = Path(args.run)
@@ -625,11 +764,14 @@ def main():
     diag_subdir = os.path.join(args.flow_diag_dir, run_dir.name, args.split)
     _ensure_dir(diag_subdir)
 
-    u, _ = flow.y_to_u(y_expert, cond)
-    u_np = u.detach().cpu().numpy().reshape(-1)
+    # Flow PIT: u is latent ~ N(0,1) under a calibrated density.
+    # PIT values should be Uniform(0,1): PIT = Phi(u).
+    u_latent, _ = flow.y_to_u(y_expert, cond)
+    pit = Normal(0.0, 1.0).cdf(u_latent)
+    pit_np = pit.detach().cpu().numpy().reshape(-1)
 
     pit_png = os.path.join(diag_subdir, "pit_hist.png")
-    pit_stats = _plot_pit(u_np, pit_png)
+    pit_stats = _plot_pit(pit_np, pit_png)
     with open(os.path.join(diag_subdir, "pit_stats.json"), "w", encoding="utf-8") as f:
         json.dump(pit_stats, f, indent=2)
 
@@ -654,6 +796,43 @@ def main():
             ttc_cap=float(args.ttc_cap),
             out_path=pdf_png,
         )
+
+    # -------------------------
+    # Strategy A: sigma_log via flow sampling (tau-independent, but we report stats per tau for gated/all)
+    # -------------------------
+    sigma_log_np: Optional[np.ndarray] = None
+    if int(args.uncertainty_samples) > 0:
+        print(f"[INFO] Computing sigma_log via flow sampling: S={int(args.uncertainty_samples)} (batch={int(args.uncertainty_batch)})")
+        sigma_log_np = infer_flow_sigma_log(
+            flow,
+            cond,
+            target_mu=float(state.target_std.mu_y),
+            target_sigma=float(state.target_std.sigma_y),
+            num_samples=int(args.uncertainty_samples),
+            batch=int(args.uncertainty_batch),
+            device=device,
+        )
+
+        # Save per-sample sigma for reuse (e.g., subgroup analysis)
+        np.save(os.path.join(diag_subdir, "sigma_log.npy"), sigma_log_np)
+        sigma_stats = {
+            "n": int(sigma_log_np.size),
+            "mean": float(np.nanmean(sigma_log_np)) if sigma_log_np.size else float("nan"),
+            "std": float(np.nanstd(sigma_log_np)) if sigma_log_np.size else float("nan"),
+            "p50": float(np.nanpercentile(sigma_log_np, 50)) if sigma_log_np.size else float("nan"),
+            "p90": float(np.nanpercentile(sigma_log_np, 90)) if sigma_log_np.size else float("nan"),
+        }
+        with open(os.path.join(diag_subdir, "sigma_log_stats.json"), "w", encoding="utf-8") as f:
+            json.dump(sigma_stats, f, indent=2)
+
+    # Prepare subgroup feature arrays once (Strategy B)
+    subgroup_features = [s.strip() for s in str(args.subgroup_features).split(",") if s.strip()]
+    subgroup_vals: Dict[str, np.ndarray] = {}
+    for feat in subgroup_features:
+        try:
+            subgroup_vals[feat] = _get_feature_array(ds, feat)
+        except KeyError:
+            print(f"[WARN] subgroup feature not found in tensors: {feat} (skip)")
 
     # -------------------------
     # Tau sweep
@@ -740,18 +919,98 @@ def main():
         tau_dir = os.path.join(diag_subdir, f"tau_{tau}")
         _ensure_dir(tau_dir)
 
+        # -------------------------
+        # Strategy A (summary): sigma_log on all vs gated
+        # -------------------------
+        if sigma_log_np is not None:
+            if args.uncertainty_scope in ("all", "both"):
+                out["sigma_log_mean_all"] = float(np.nanmean(sigma_log_np))
+                out["sigma_log_p90_all"] = float(np.nanpercentile(sigma_log_np, 90))
+            if args.uncertainty_scope in ("gated", "both"):
+                if gated_mask.any():
+                    sg = sigma_log_np[gated_mask]
+                    out["sigma_log_mean_gated"] = float(np.nanmean(sg))
+                    out["sigma_log_p90_gated"] = float(np.nanpercentile(sg, 90))
+                else:
+                    out["sigma_log_mean_gated"] = float("nan")
+                    out["sigma_log_p90_gated"] = float("nan")
+
+        # -------------------------
+        # Strategy B: subgroup split (median or quantile3)
+        # -------------------------
+        if len(subgroup_vals) > 0:
+            subgroup_rows = []
+            for feat, vals in subgroup_vals.items():
+                for bin_name, bin_mask in _make_bins(vals, args.subgroup_split):
+                    m_all = bin_mask
+                    n_all = int(np.sum(m_all))
+                    if n_all == 0:
+                        continue
+
+                    row = {
+                        "feature": feat,
+                        "split": args.subgroup_split,
+                        "bin": bin_name,
+                        "n_all": n_all,
+                    }
+
+                    if args.subgroup_on in ("all", "both"):
+                        row["pos_rate_all"] = float(np.mean(y_true_np[m_all])) if n_all else float("nan")
+                        row["p_gate_mean_all"] = float(np.mean(p_gate_np[m_all])) if n_all else float("nan")
+                        row["p_event_mean_all"] = float(np.mean(p_event_np[m_all])) if n_all else float("nan")
+                        row["risk_mean_all"] = float(np.mean(risk_np[m_all])) if n_all else float("nan")
+                        if sigma_log_np is not None:
+                            row["sigma_log_mean_all"] = float(np.nanmean(sigma_log_np[m_all]))
+                            row["sigma_log_p90_all"] = float(np.nanpercentile(sigma_log_np[m_all], 90))
+                    else:
+                        row["pos_rate_all"] = float("nan")
+                        row["p_gate_mean_all"] = float("nan")
+                        row["p_event_mean_all"] = float("nan")
+                        row["risk_mean_all"] = float("nan")
+                        if sigma_log_np is not None:
+                            row["sigma_log_mean_all"] = float("nan")
+                            row["sigma_log_p90_all"] = float("nan")
+
+                    m_g = m_all & gated_mask
+                    n_g = int(np.sum(m_g))
+                    row["n_gated"] = n_g
+                    if args.subgroup_on in ("gated", "both"):
+                        row["pos_rate_gated"] = float(np.mean(y_true_np[m_g])) if n_g else float("nan")
+                        row["p_gate_mean_gated"] = float(np.mean(p_gate_np[m_g])) if n_g else float("nan")
+                        row["p_event_mean_gated"] = float(np.mean(p_event_np[m_g])) if n_g else float("nan")
+                        row["risk_mean_gated"] = float(np.mean(risk_np[m_g])) if n_g else float("nan")
+                        if sigma_log_np is not None:
+                            row["sigma_log_mean_gated"] = float(np.nanmean(sigma_log_np[m_g])) if n_g else float("nan")
+                            row["sigma_log_p90_gated"] = float(np.nanpercentile(sigma_log_np[m_g], 90)) if n_g else float("nan")
+                    else:
+                        row["pos_rate_gated"] = float("nan")
+                        row["p_gate_mean_gated"] = float("nan")
+                        row["p_event_mean_gated"] = float("nan")
+                        row["risk_mean_gated"] = float("nan")
+                        if sigma_log_np is not None:
+                            row["sigma_log_mean_gated"] = float("nan")
+                            row["sigma_log_p90_gated"] = float("nan")
+
+                    subgroup_rows.append(row)
+
+            if len(subgroup_rows) > 0:
+                subgroup_df = pd.DataFrame(subgroup_rows)
+                subgroup_csv = os.path.join(tau_dir, "subgroup_summary.csv")
+                subgroup_df.to_csv(subgroup_csv, index=False)
+                out["subgroup_summary_csv"] = subgroup_csv
+
         calib_png = os.path.join(tau_dir, "p_event_calibration.png")
         calib_csv = os.path.join(tau_dir, "p_event_calibration.csv")
         calib_stats = _save_calibration_curve(y_cal, p_cal, calib_png, calib_csv, n_bins=int(args.calib_bins))
 
-        # KS distance: empirical CDF of PIT u vs Uniform (optionally on gated subset only)
+        # KS distance: empirical CDF of PIT vs Uniform (optionally on gated subset only)
         if args.ks_on_gated_only:
-            u_use = u_np[gated_mask]
+            pit_use = pit_np[gated_mask]
         else:
-            u_use = u_np
+            pit_use = pit_np
 
         ks_png = os.path.join(tau_dir, "pit_ks_cdf.png")
-        ks_stats = _save_ks_plot_u_vs_uniform(u_use, ks_png)
+        ks_stats = _save_ks_plot_u_vs_uniform(pit_use, ks_png)
 
         # Attach these tau diagnostics to the summary json
         out["p_event_calib_ece"] = float(calib_stats.get("ece", float("nan")))
