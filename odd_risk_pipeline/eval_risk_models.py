@@ -71,6 +71,9 @@ def compute_sigma_log_from_flow(
     """
     if num_samples <= 0:
         raise ValueError("num_samples must be > 0")
+    eff_sigma = float(sigma_y) if sigma_y is not None else (float(y_log_sigma) if y_log_sigma is not None else None)
+    if eff_sigma is None:
+        raise ValueError("Need sigma_y or y_log_sigma to convert to logTTC space")
 
     # cond can be Tensor or tuple(Tensor, Tensor) (FiLM)
     def _slice_cond(c, sl):
@@ -844,7 +847,9 @@ def infer_flow_sigma_log(
     device: torch.device,
     batch: int,
     num_samples: int,
-    y_log_sigma: float,
+    y_log_sigma: Optional[float] = None,
+    mu_y: float = 0.0,
+    sigma_y: Optional[float] = None,
 ) -> np.ndarray:
     """Estimate per-sample uncertainty sigma in logTTC space.
 
@@ -892,7 +897,7 @@ def infer_flow_sigma_log(
 
         ys = flow.sample(cond, num_samples=num_samples)  # [B, S] in standardized logTTC
         sig_std = ys.std(dim=1, unbiased=False)
-        sig_log = sig_std * float(y_log_sigma)
+        sig_log = sig_std * float(eff_sigma)
         out[i0:i1] = sig_log.float().detach().cpu().numpy()
 
     return out

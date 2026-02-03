@@ -120,6 +120,26 @@ def main():
     ap.add_argument("--warp_p", type=float, default=0.35, help="Raw-space warp probability on gate negatives.")
     ap.add_argument("--warp_speed_scale_min", type=float, default=1.05)
     ap.add_argument("--warp_speed_scale_max", type=float, default=1.25)
+    # Expert warp augmentation (mix warped samples into Expert batches)
+    ap.add_argument("--expert_warp_p", type=float, default=0.0, help="probability to warp each Expert sample (0 disables)")
+    ap.add_argument("--expert_warp_closing_add_min", type=float, default=0.5)
+    ap.add_argument("--expert_warp_closing_add_max", type=float, default=6.0)
+    ap.add_argument("--expert_warp_speed_scale_min", type=float, default=1.0)
+    ap.add_argument("--expert_warp_speed_scale_max", type=float, default=1.2)
+
+    # Advanced expert-warp knobs (optional). Defaults match RawWarpConfig.
+    # NOTE: Names intentionally generic to keep backward compatibility with
+    # earlier patch versions that referenced args.speed_cap_mps, etc.
+    ap.add_argument("--speed_cap_mps", type=float, default=60.0,
+                    help="Expert-warp: cap on ego speed after warping (m/s).")
+    ap.add_argument("--closing_cap_mps", type=float, default=80.0,
+                    help="Expert-warp: cap on closing speed after warping (m/s).")
+    ap.add_argument("--candidate_range_m", type=float, default=50.0,
+                    help="Expert-warp: candidate range for gate-like physics label (m).")
+    ap.add_argument("--closing_thr_mps", type=float, default=0.5,
+                    help="Expert-warp: closing-speed threshold for physics-gated labeling (m/s).")
+    ap.add_argument("--ttc_max_s", type=float, default=8.0,
+                    help="Expert-warp: max TTC (s) used in physics-gated labeling.")
 
     ap.add_argument("--dropout", type=float, default=0.2, help="Callback dropout rate")
     ap.add_argument("--hidden", type=int, default=64, help="Model hidden dim")
@@ -135,7 +155,7 @@ def main():
                     help="Expert/Flow training only: with this probability per-sample, drop (set-to-mean) the entire c__ context block to reduce segment fingerprinting.")
     ap.add_argument("--val_ratio", type=float, default=0.15)
     ap.add_argument("--test_ratio", type=float, default=0.15)
-    ap.add_argument("--gate_epochs", type=int, default=30)
+    ap.add_argument("--gate_epochs", type=int, default=50)
     ap.add_argument("--expert_epochs", type=int, default=50)
     ap.add_argument(
         "--drop_leakage_cols",
@@ -311,7 +331,22 @@ def main():
         closing_thr_mps=args.gate_closing_thr_mps,
         ttc_max_s=args.gate_ttc_max_s,
     )
-    
+
+
+    # Expert warp config (separate knobs from Gate warp)
+    expert_warp_cfg = RawWarpConfig(
+        p_warp=float(args.expert_warp_p),
+        speed_scale_min=float(args.expert_warp_speed_scale_min),
+        speed_scale_max=float(args.expert_warp_speed_scale_max),
+        closing_add_min=float(args.expert_warp_closing_add_min),
+        closing_add_max=float(args.expert_warp_closing_add_max),
+        speed_cap_mps=float(args.speed_cap_mps),
+        closing_cap_mps=float(args.closing_cap_mps),
+        candidate_range_m=float(args.candidate_range_m),
+        closing_thr_mps=float(args.closing_thr_mps),
+        ttc_max_s=float(args.ttc_max_s),
+    )
+
     optimizer = torch.optim.AdamW(gate.parameters(), lr=cfg.gate_lr, weight_decay=cfg.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True)
 
@@ -384,15 +419,36 @@ def main():
 
     for ep in range(cfg.expert_epochs):
         tr = train_expert_one_epoch_raw(
-            flow, expert_loader, optimizer, cfg, expert_mean, expert_std,
+            flow,
+            expert_loader,
+            optimizer,
+            cfg,
+            expert_mean,
+            expert_std,
             drop_idx=drop_idx_t,
             ctx_all_idx=ctx_all_idx_t,
             ctx_block_drop_prob=args.expert_ctx_block_drop_prob,
+            expert_warp_cfg=expert_warp_cfg,
+            expert_feature_index=ds_train.expert_feature_index,
+            ttc_floor_s=float(args.ttc_floor),
+            ttc_cap_s=float(args.ttc_cap),
+            target_mu_y=float(state.target_std.mu_y),
+            target_sigma_y=float(state.target_std.sigma_y),
         )
-        va = eval_expert_raw(flow, expert_val_loader, device, expert_mean, expert_std, drop_idx=drop_idx_t)
+
+        va = eval_expert_raw(
+            flow,
+            expert_val_loader,
+            device,
+            expert_mean,
+            expert_std,
+            drop_idx=drop_idx_t,
+        )
         scheduler.step(va)
-        
-        print(f"[Expert] epoch {ep+1}/{cfg.expert_epochs} train_nll={tr:.4f} val_nll={va:.4f} lr={optimizer.param_groups[0]['lr']:.2e}")
+    
+        print(
+            f"[Expert] epoch {ep+1}/{cfg.expert_epochs} train_nll={tr:.4f} val_nll={va:.4f} lr={optimizer.param_groups[0]['lr']:.2e}"
+        )
         if va < best:
             best = va
             patience_counter = 0

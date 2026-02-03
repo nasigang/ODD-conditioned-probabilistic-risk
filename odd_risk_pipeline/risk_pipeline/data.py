@@ -68,6 +68,9 @@ class RiskCSVDataset(Dataset):
         # For raw-space warp: feature name -> index inside x_gate_raw
         self.gate_feature_index = {name: i for i, name in enumerate(self.schema.x_gate_cols_in_order())}
 
+        # For raw-space warp: feature name -> index inside x_expert_raw
+        self.expert_feature_index = {name: i for i, name in enumerate(self.schema.x_expert_cols_in_order())}
+
     def get_x_gate_colnames(self) -> List[str]:
         return list(self.x_gate_cols)
 

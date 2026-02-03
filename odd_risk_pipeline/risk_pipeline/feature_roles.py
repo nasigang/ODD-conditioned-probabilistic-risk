@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, asdict
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import pandas as pd
 
@@ -25,7 +25,8 @@ class FeatureRoleMap:
     dropped_x: List[str]
     prefix: str = "ctx__"
     regex: str = ""
-    explicit: List[str] | None = None
+    # Python 3.8 compatibility: avoid PEP604 union syntax.
+    explicit: Optional[List[str]] = None
 
 
 def _parse_csv_list(s: str) -> List[str]:

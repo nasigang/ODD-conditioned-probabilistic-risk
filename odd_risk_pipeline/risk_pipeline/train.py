@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 
 from .models import GateMLP, focal_loss_with_logits, ConditionalSpline1DFlow
-from .warp import RawWarpConfig, kinematic_warp_raw_x_gate
+from .warp import RawWarpConfig, kinematic_warp_raw_x_gate, kinematic_warp_raw_x_expert
 
 
 @dataclass
@@ -139,6 +139,14 @@ def train_expert_one_epoch_raw(
     ctx_block_drop_prob: float = 0.0,
     flow_x_idx: Optional[Union[torch.Tensor, List[int]]] = None,
     flow_c_idx: Optional[Union[torch.Tensor, List[int]]] = None,
+    # --- Expert raw-space warp augmentation (optional) ---
+    expert_warp_cfg: Optional[RawWarpConfig] = None,
+    expert_feature_index: Optional[Dict[str, int]] = None,
+    # Needed to rebuild y in *standardized logTTC-space* when warping.
+    ttc_floor_s: float = 0.05,
+    ttc_cap_s: float = 10.0,
+    target_mu_y: float = 0.0,
+    target_sigma_y: float = 1.0,
 ) -> float:
     flow.train()
     total, n = 0.0, 0
@@ -166,15 +174,40 @@ def train_expert_one_epoch_raw(
         if keep.sum() < 2:
             continue
 
-        x_scaled_full = (x_raw[keep] - expert_mean) / (expert_std + 1e-6)
+        # --- Expert raw-space warp augmentation (optional) ---
+        # Warp in RAW feature space and rebuild y_expert in standardized logTTC-space.
+        if expert_warp_cfg is not None and float(expert_warp_cfg.p_warp) > 0.0 and expert_feature_index is not None:
+            x_keep_raw = x_raw[keep]
+            y_keep = y[keep]
+            cens_keep = batch["censored_mask"].to(cfg.device)[keep]
+            x_keep_raw, y_keep, cens_keep, _ = kinematic_warp_raw_x_expert(
+                x_keep_raw,
+                y_keep,
+                cens_keep,
+                expert_feature_index,
+                expert_warp_cfg,
+                ttc_floor_s=float(ttc_floor_s),
+                ttc_cap_s=float(ttc_cap_s),
+                target_mu_y=float(target_mu_y),
+                target_sigma_y=float(target_sigma_y),
+            )
+            x_raw_keep = x_keep_raw
+            y_k_full = y_keep
+            cens_full = (cens_keep > 0.5)
+        else:
+            x_raw_keep = x_raw[keep]
+            y_k_full = y[keep]
+            cens_full = (batch["censored_mask"].to(cfg.device)[keep] > 0.5)
+
+        x_scaled_full = _scale(x_raw_keep, expert_mean, expert_std)
         if cfg.input_noise > 0:
             x_scaled_full = x_scaled_full + torch.randn_like(x_scaled_full) * cfg.input_noise
 
         cond = _make_flow_cond(x_scaled_full, flow, flow_x_idx=flow_x_idx, flow_c_idx=flow_c_idx)
 
-        is_censored = (batch["censored_mask"].to(cfg.device)[keep] > 0.5)
-        loss_val = torch.zeros_like(y[keep])
-        y_k = y[keep]
+        is_censored = cens_full
+        loss_val = torch.zeros_like(y_k_full)
+        y_k = y_k_full
 
         mask_u = ~is_censored
         if mask_u.any():
