@@ -83,17 +83,32 @@ def rqs_forward(
     )
 
     x_clamped = torch.clamp(x, left, right)
-    bin_idx = torch.sum(x_clamped[..., None] >= cumw[..., 1:], dim=-1)
+
+    # Expand spline params to match x's extra (sample) dims.
+    # widths/heights/cumw/cumh/deriv are per-row (batch) parameters.
+    def _expand_param(p: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+        q = p
+        for _ in range(ref.dim() - 1):
+            q = q.unsqueeze(1)
+        return q.expand(*ref.shape, p.shape[-1])
+
+    widths_e = _expand_param(widths, x_clamped)
+    heights_e = _expand_param(heights, x_clamped)
+    deriv_e = _expand_param(deriv, x_clamped)
+    cumw_e = _expand_param(cumw, x_clamped)
+    cumh_e = _expand_param(cumh, x_clamped)
+
+    bin_idx = torch.sum(x_clamped[..., None] >= cumw_e[..., 1:], dim=-1)
     bin_idx = torch.clamp(bin_idx, 0, widths.shape[-1] - 1)
 
-    x0 = cumw.gather(-1, bin_idx.unsqueeze(-1)).squeeze(-1)
-    w = widths.gather(-1, bin_idx.unsqueeze(-1)).squeeze(-1)
-    y0 = cumh.gather(-1, bin_idx.unsqueeze(-1)).squeeze(-1)
-    h = heights.gather(-1, bin_idx.unsqueeze(-1)).squeeze(-1)
+    x0 = cumw_e.gather(-1, bin_idx.unsqueeze(-1)).squeeze(-1)
+    w = widths_e.gather(-1, bin_idx.unsqueeze(-1)).squeeze(-1)
+    y0 = cumh_e.gather(-1, bin_idx.unsqueeze(-1)).squeeze(-1)
+    h = heights_e.gather(-1, bin_idx.unsqueeze(-1)).squeeze(-1)
 
     delta = h / w
-    d0 = deriv.gather(-1, bin_idx.unsqueeze(-1)).squeeze(-1)
-    d1 = deriv.gather(-1, (bin_idx + 1).unsqueeze(-1)).squeeze(-1)
+    d0 = deriv_e.gather(-1, bin_idx.unsqueeze(-1)).squeeze(-1)
+    d1 = deriv_e.gather(-1, (bin_idx + 1).unsqueeze(-1)).squeeze(-1)
 
     theta = (x_clamped - x0) / w
     omt = 1 - theta
@@ -112,6 +127,96 @@ def rqs_forward(
     y = torch.where(below | above, x, y)
     logdet = torch.where(below | above, torch.zeros_like(logdet), logdet)
     return y, logdet
+
+
+def rqs_inverse(
+    y: torch.Tensor,
+    un_w: torch.Tensor,
+    un_h: torch.Tensor,
+    un_d: torch.Tensor,
+    bound: float = 5.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Inverse of rqs_forward (monotone rational-quadratic spline).
+
+    Notes
+    -----
+    - This implements the analytic inverse used in spline flows (Durkan et al.).
+    - Outside [-bound, bound], the transform is identity (same as rqs_forward).
+
+    Returns
+    -------
+    x : torch.Tensor
+        Inverse-mapped value.
+    logdet : torch.Tensor
+        log|dx/dy| (inverse log-det Jacobian). Useful if you later need u->y log-prob.
+    """
+    left, right, bottom, top = -bound, bound, -bound, bound
+    widths, heights, deriv, cumw, cumh = _unconstrained_to_spline_params(
+        un_w, un_h, un_d, left, right, bottom, top
+    )
+
+    y_clamped = torch.clamp(y, bottom, top)
+
+    # Expand spline params to match y's extra (sample) dims.
+    def _expand_param(p: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+        q = p
+        for _ in range(ref.dim() - 1):
+            q = q.unsqueeze(1)
+        return q.expand(*ref.shape, p.shape[-1])
+
+    widths_e = _expand_param(widths, y_clamped)
+    heights_e = _expand_param(heights, y_clamped)
+    deriv_e = _expand_param(deriv, y_clamped)
+    cumw_e = _expand_param(cumw, y_clamped)
+    cumh_e = _expand_param(cumh, y_clamped)
+
+    # choose bin by y (cumheights)
+    bin_idx = torch.sum(y_clamped[..., None] >= cumh_e[..., 1:], dim=-1)
+    bin_idx = torch.clamp(bin_idx, 0, widths.shape[-1] - 1)
+
+    y0 = cumh_e.gather(-1, bin_idx.unsqueeze(-1)).squeeze(-1)
+    h = heights_e.gather(-1, bin_idx.unsqueeze(-1)).squeeze(-1)
+    x0 = cumw_e.gather(-1, bin_idx.unsqueeze(-1)).squeeze(-1)
+    w = widths_e.gather(-1, bin_idx.unsqueeze(-1)).squeeze(-1)
+
+    delta = h / w
+    d0 = deriv_e.gather(-1, bin_idx.unsqueeze(-1)).squeeze(-1)
+    d1 = deriv_e.gather(-1, (bin_idx + 1).unsqueeze(-1)).squeeze(-1)
+
+    # a in [0,1]
+    a = (y_clamped - y0) / torch.clamp(h, min=1e-12)
+    A = d0 + d1 - 2.0 * delta
+
+    # Solve quadratic for theta (see nflows / NSF-RQS inverse).
+    c2 = a * A + delta - d0
+    c1 = d0 - a * A
+    c0 = -a * delta
+
+    disc = torch.clamp(c1.pow(2) - 4.0 * c2 * c0, min=1e-12)
+    sqrt_disc = torch.sqrt(disc)
+
+    # Numerically stable root in [0,1]
+    denom = (-c1 - sqrt_disc)
+    denom = torch.where(denom.abs() < 1e-12, denom.sign() * 1e-12, denom)
+    theta = (2.0 * c0) / denom
+    theta = torch.clamp(theta, 0.0, 1.0)
+
+    x = x0 + theta * w
+
+    # Inverse logdet: log|dx/dy| = -log|dy/dx|
+    omt = 1.0 - theta
+    den = delta + A * theta * omt
+    der_num = delta.pow(2) * (d1 * theta.pow(2) + 2.0 * delta * theta * omt + d0 * omt.pow(2))
+    der_den = torch.clamp(den.pow(2), min=1e-12)
+    der_num = torch.clamp(der_num, min=1e-12)
+    logdet_fwd = torch.log(der_num) - torch.log(der_den)
+    logdet_inv = -logdet_fwd
+
+    below = y < bottom
+    above = y > top
+    x = torch.where(below | above, y, x)
+    logdet_inv = torch.where(below | above, torch.zeros_like(logdet_inv), logdet_inv)
+    return x, logdet_inv
 
 
 CondInput = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -240,6 +345,48 @@ class ConditionalSpline1DFlow(nn.Module):
         un_w, un_h, un_d = self._params(cond)
         u, logdet = rqs_forward(y, un_w, un_h, un_d, bound=self.tail_bound)
         return u, logdet
+
+    def u_to_y(self, u: torch.Tensor, cond: CondInput) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Inverse map (latent u -> standardized y).
+
+        This is the missing piece needed for Monte-Carlo sampling / uncertainty diagnostics.
+        """
+        un_w, un_h, un_d = self._params(cond)
+        y, logdet = rqs_inverse(u, un_w, un_h, un_d, bound=self.tail_bound)
+        return y, logdet
+
+    @torch.no_grad()
+    def sample(self, cond: CondInput, *, num_samples: int = 1) -> torch.Tensor:
+        """Sample standardized y from the conditional flow.
+
+        Parameters
+        ----------
+        cond : Tensor or (x_part, c_part)
+            Condition vector(s). Shape is [B, D] (concat) or ([B, x_dim], [B, c_dim]) (FiLM).
+        num_samples : int
+            Number of samples per condition (S).
+
+        Returns
+        -------
+        y : torch.Tensor
+            Samples in standardized y-space with shape [B, S].
+        """
+        if num_samples <= 0:
+            raise ValueError("num_samples must be > 0")
+
+        # Determine batch size + device/dtype from cond
+        if isinstance(cond, (tuple, list)):
+            B = int(cond[0].shape[0])
+            device = cond[0].device
+            dtype = cond[0].dtype
+        else:
+            B = int(cond.shape[0])
+            device = cond.device
+            dtype = cond.dtype
+
+        u = torch.randn((B, int(num_samples)), device=device, dtype=dtype)
+        y, _ = self.u_to_y(u, cond)
+        return y
 
     def log_prob(self, y: torch.Tensor, cond: CondInput) -> torch.Tensor:
         u, logdet = self.y_to_u(y, cond)

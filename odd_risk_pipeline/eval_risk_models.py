@@ -55,9 +55,10 @@ def compute_sigma_log_from_flow(
     expert,
     cond,
     mu_y: float,
-    sigma_y: float,
+    sigma_y: Optional[float],
     num_samples: int,
     batch_size: int = 4096,
+    y_log_sigma: Optional[float] = None,
 ) -> np.ndarray:
     """Estimate per-sample uncertainty in logTTC space via sampling.
 
@@ -95,7 +96,7 @@ def compute_sigma_log_from_flow(
         y_std = expert.sample(c_b, num_samples=num_samples)
         # std over samples in standardized space
         sig_std = y_std.float().std(dim=1, unbiased=False)
-        out[s:e] = (sig_std * float(sigma_y)).cpu().numpy().astype(np.float32)
+        out[s:e] = (sig_std * float(eff_sigma)).cpu().numpy().astype(np.float32)
     return out
 
 
@@ -861,6 +862,12 @@ def infer_flow_sigma_log(
     if num_samples <= 0:
         raise ValueError("num_samples must be > 0")
 
+    # Convert from standardized y-space to logTTC-space:
+    #   y_std = (logTTC - mu_y) / sigma_y  =>  std(logTTC) = std(y_std) * sigma_y
+    eff_sigma = float(sigma_y) if sigma_y is not None else (float(y_log_sigma) if y_log_sigma is not None else None)
+    if eff_sigma is None:
+        raise ValueError("Need sigma_y (preferred) or y_log_sigma to convert std(y_std) to std(logTTC)")
+
     n = x_ctx_raw.shape[0]
     out = np.empty((n,), dtype=np.float32)
     flow.eval()
@@ -1057,6 +1064,8 @@ def main():
                     help="If >0, draw this many samples per point from the Flow and report σ_log (std in logTTC space).")
     ap.add_argument("--uncertainty_scope", type=str, default="both", choices=["all", "gated", "both"],
                     help="Compute σ_log for all points, gate-passed points, or both. (We compute per-point σ_log once; scope affects reporting/subsetting.)")
+    ap.add_argument("--uncertainty_gate_threshold", type=float, default=None,
+                    help="Gate threshold used when reporting gate-pass uncertainty stats. If not set, derived to hit --gate_target_recall.")
     ap.add_argument("--gate_target_recall", type=float, default=0.90,
                     help="When gating is needed for σ_log reporting, compute an automatic threshold to reach this recall on positives.")
     ap.add_argument("--gate_threshold", type=float, default=None,
@@ -1230,8 +1239,9 @@ def main():
                 )
 
                 # gate threshold used for "gate-pass" subset stats
-                if args.uncertainty_gate_threshold is not None:
-                    gate_thr_for_sigma = float(args.uncertainty_gate_threshold)
+                gate_thr_arg = getattr(args, "uncertainty_gate_threshold", None)
+                if gate_thr_arg is not None:
+                    gate_thr_for_sigma = float(gate_thr_arg)
                 else:
                     gate_thr_for_sigma = gate_threshold_for_target_recall(
                         p_gate,

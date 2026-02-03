@@ -297,11 +297,24 @@ def kinematic_warp_raw_x_expert(
     target_mu_y: float,
     target_sigma_y: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Append warped samples into Expert batch (one-direction warp + physics-gated labeling).
+    """Append label-consistent warped samples into Expert batch.
 
-    - Warp ONLY the dominant risk direction among {front, rear, side}, based on max positive closing speed.
-    - Recompute `x__max_closing_speed_any_mps` / `x__max_closing_speed_side_mps` if present.
-    - Recompute TTC proxy and update y in **logTTC-space**, with strict censoring at ttc_cap.
+    핵심(첨부 PDF 요구사항 반영)
+    ---------------------------
+    1) Expert warp는 feature만 바꾸면 끝이 아니라, **y_expert(=표준화 logTTC)** 를 반드시 재생성해야 한다.
+    2) Warp는 {front, rear, side(max(left,right))} 중 **가장 위험한(=양수 closing이 가장 큰) 한 방향만** 적용한다.
+    3) Warp 후에는 any/side aggregate closing을 재정합(recompute)한다.
+    4) y_expert 재생성은 선택된 동일 방향의 (range, closing)으로
+         TTC' = range_dir / (max(closing_dir, 0) + eps)
+       를 계산한 뒤 log/clip/standardize 한다.
+    5) TTC'가 ttc_cap에 걸리면 strict right-censoring으로 처리한다.
+
+    Returns
+    -------
+    x_aug : [B + Bw, D]
+    y_aug : [B + Bw]
+    cens_aug : [B + Bw]
+    is_warp : bool mask [B + Bw] (True for appended warped rows)
     """
     device = x_expert_raw.device
     B, _ = x_expert_raw.shape
@@ -310,7 +323,7 @@ def kinematic_warp_raw_x_expert(
         is_warp = torch.zeros((B,), device=device, dtype=torch.bool)
         return x_expert_raw, y_expert, censored_mask, is_warp
 
-    # Candidate filter to avoid warping totally irrelevant "no-approach" rows
+    # Candidate filter: avoid warping clearly irrelevant "no-approach" rows
     i_rng_any = _get_optional_idx(feature_index, "x__min_range_any_m")
     i_cls_any = _get_optional_idx(feature_index, "x__max_closing_speed_any_mps")
     if i_rng_any is not None and i_cls_any is not None:
@@ -324,78 +337,133 @@ def kinematic_warp_raw_x_expert(
         is_warp = torch.zeros((B,), device=device, dtype=torch.bool)
         return x_expert_raw, y_expert, censored_mask, is_warp
 
-    xw = x_expert_raw.clone()
+    # Work only on warped rows
+    xw = x_expert_raw[idx].clone()  # [Bw, D]
+    Bw = xw.shape[0]
 
+    # Column indices (optional)
     i_f = _get_optional_idx(feature_index, "x__max_closing_speed_front_mps")
     i_r = _get_optional_idx(feature_index, "x__max_closing_speed_rear_mps")
     i_l = _get_optional_idx(feature_index, "x__max_closing_speed_left_mps")
     i_rt = _get_optional_idx(feature_index, "x__max_closing_speed_right_mps")
     i_speed = _get_optional_idx(feature_index, "x__ego_speed_mps")
 
-    # compute dominant direction (front/rear/side) using non-negative closings
+    i_rf = _get_optional_idx(feature_index, "x__min_range_front_m")
+    i_rr = _get_optional_idx(feature_index, "x__min_range_rear_m")
+    i_rl = _get_optional_idx(feature_index, "x__min_range_left_m")
+    i_rrt = _get_optional_idx(feature_index, "x__min_range_right_m")
+
     def _g(i):
         if i is None:
-            return torch.zeros((B,), device=device, dtype=xw.dtype)
+            return torch.zeros((Bw,), device=device, dtype=xw.dtype)
         return torch.clamp(xw[:, i], min=0.0)
 
     c_front = _g(i_f)
     c_rear = _g(i_r)
     c_left = _g(i_l)
     c_right = _g(i_rt)
+    side_is_left = (c_left >= c_right)
     c_side = torch.maximum(c_left, c_right)
 
-    stack = torch.stack([c_front, c_rear, c_side], dim=0)
+    # dominant direction among {front, rear, side}
+    stack = torch.stack([c_front, c_rear, c_side], dim=0)  # [3,Bw]
     dom = torch.argmax(stack, dim=0)  # 0 front, 1 rear, 2 side
 
-    dv = _rand_uniform((idx.numel(),), float(cfg.closing_add_min), float(cfg.closing_add_max), device=device)
+    # Sample warp magnitude per warped row
+    dv = _rand_uniform((Bw,), float(cfg.closing_add_min), float(cfg.closing_add_max), device=device)
 
-    for j, row in enumerate(idx.tolist()):
-        d = int(dom[row].item())
-        add = dv[j]
-        if d == 0 and i_f is not None:
-            xw[row, i_f] = torch.clamp(xw[row, i_f] + add, min=0.0, max=float(cfg.closing_cap_mps))
-            # optional conservative ego-speed scaling ONLY for front
+    # --- Apply one-direction warp (closing + optional speed for front only) ---
+    if i_f is not None:
+        m = (dom == 0)
+        if m.any():
+            xw[m, i_f] = torch.clamp(xw[m, i_f] + dv[m], min=0.0, max=float(cfg.closing_cap_mps))
             if i_speed is not None and float(cfg.speed_scale_max) > 1.0:
-                s = _rand_uniform((1,), float(cfg.speed_scale_min), float(cfg.speed_scale_max), device=device)[0]
-                xw[row, i_speed] = torch.clamp(xw[row, i_speed] * s, min=0.0, max=float(cfg.speed_cap_mps))
-        elif d == 1 and i_r is not None:
-            # rear: do NOT scale ego speed (sign can be opposite)
-            xw[row, i_r] = torch.clamp(xw[row, i_r] + add, min=0.0, max=float(cfg.closing_cap_mps))
-        else:
-            # side: boost the currently larger side direction
-            if i_l is not None and i_rt is not None:
-                if xw[row, i_l] >= xw[row, i_rt]:
-                    xw[row, i_l] = torch.clamp(xw[row, i_l] + add, min=0.0, max=float(cfg.closing_cap_mps))
-                else:
-                    xw[row, i_rt] = torch.clamp(xw[row, i_rt] + add, min=0.0, max=float(cfg.closing_cap_mps))
-            elif i_l is not None:
-                xw[row, i_l] = torch.clamp(xw[row, i_l] + add, min=0.0, max=float(cfg.closing_cap_mps))
-            elif i_rt is not None:
-                xw[row, i_rt] = torch.clamp(xw[row, i_rt] + add, min=0.0, max=float(cfg.closing_cap_mps))
+                s = _rand_uniform((int(m.sum().item()),), float(cfg.speed_scale_min), float(cfg.speed_scale_max), device=device)
+                xw[m, i_speed] = torch.clamp(xw[m, i_speed] * s, min=0.0, max=float(cfg.speed_cap_mps))
 
-    # Guard: never create "approach" from negative values by accident
+    if i_r is not None:
+        m = (dom == 1)
+        if m.any():
+            # rear: do NOT scale ego speed (directional sign ambiguity)
+            xw[m, i_r] = torch.clamp(xw[m, i_r] + dv[m], min=0.0, max=float(cfg.closing_cap_mps))
+
+    # side: boost the currently larger side direction only
+    if (i_l is not None) or (i_rt is not None):
+        m_side = (dom == 2)
+        if m_side.any():
+            if i_l is not None:
+                mL = m_side & side_is_left
+                if mL.any():
+                    xw[mL, i_l] = torch.clamp(xw[mL, i_l] + dv[mL], min=0.0, max=float(cfg.closing_cap_mps))
+            if i_rt is not None:
+                mR = m_side & (~side_is_left)
+                if mR.any():
+                    xw[mR, i_rt] = torch.clamp(xw[mR, i_rt] + dv[mR], min=0.0, max=float(cfg.closing_cap_mps))
+
+    # Guard: never allow negative closing after warp
     for i in (i_f, i_r, i_l, i_rt):
         if i is not None:
             xw[:, i] = torch.clamp(xw[:, i], min=0.0, max=float(cfg.closing_cap_mps))
 
+    # Recompute aggregate closing speeds if present (any/side)
     _recompute_any_and_side_closing(xw, feature_index)
 
-    x_warp = xw[idx]
-    ttc_p = _ttc_proxy_from_ranges_and_closing(x_warp, feature_index, float(cfg.closing_thr_mps), float(ttc_cap_s))
-    ttc_p = torch.clamp(ttc_p, min=float(ttc_floor_s), max=float(ttc_cap_s))
-    log_ttc = _safe_log(ttc_p)
+    # --- Label recompute: TTC' from the SAME chosen direction ---
+    eps = 1e-3
+    ttc = torch.full((Bw,), float(ttc_cap_s), device=device, dtype=xw.dtype)
+
+    # front TTC
+    if i_rf is not None and i_f is not None:
+        m = (dom == 0)
+        if m.any():
+            rng = torch.clamp(xw[m, i_rf], min=0.0)
+            clo = torch.clamp(xw[m, i_f], min=0.0)
+            ttc[m] = rng / (clo + eps)
+
+    # rear TTC
+    if i_rr is not None and i_r is not None:
+        m = (dom == 1)
+        if m.any():
+            rng = torch.clamp(xw[m, i_rr], min=0.0)
+            clo = torch.clamp(xw[m, i_r], min=0.0)
+            ttc[m] = rng / (clo + eps)
+
+    # side TTC uses the boosted side (left vs right) choice
+    if dom.eq(2).any():
+        if i_l is not None and i_rl is not None:
+            mL = (dom == 2) & side_is_left
+            if mL.any():
+                rng = torch.clamp(xw[mL, i_rl], min=0.0)
+                clo = torch.clamp(xw[mL, i_l], min=0.0)
+                ttc[mL] = rng / (clo + eps)
+        if i_rt is not None and i_rrt is not None:
+            mR = (dom == 2) & (~side_is_left)
+            if mR.any():
+                rng = torch.clamp(xw[mR, i_rrt], min=0.0)
+                clo = torch.clamp(xw[mR, i_rt], min=0.0)
+                ttc[mR] = rng / (clo + eps)
+
+    # Clip + strict censoring at cap
+    ttc = torch.clamp(ttc, min=float(ttc_floor_s), max=float(ttc_cap_s))
+    log_ttc = _safe_log(ttc)
 
     y_c = (math.log(float(ttc_cap_s)) - float(target_mu_y)) / float(target_sigma_y)
     y_new = (log_ttc - float(target_mu_y)) / float(target_sigma_y)
-    is_cens_new = (ttc_p >= float(ttc_cap_s) - 1e-6)
+
+    is_cens_new = (ttc >= float(ttc_cap_s) - 1e-6)
     y_new = torch.where(is_cens_new, torch.full_like(y_new, float(y_c)), y_new)
     cens_new = is_cens_new.to(dtype=censored_mask.dtype)
 
-    x_aug = torch.cat([x_expert_raw, x_warp], dim=0)
+    x_aug = torch.cat([x_expert_raw, xw], dim=0)
     y_aug = torch.cat([y_expert, y_new], dim=0)
     cens_aug = torch.cat([censored_mask, cens_new], dim=0)
-    is_warp = torch.cat([
-        torch.zeros((B,), device=device, dtype=torch.bool),
-        torch.ones((idx.numel(),), device=device, dtype=torch.bool)
-    ], dim=0)
+
+    is_warp = torch.cat(
+        [
+            torch.zeros((B,), device=device, dtype=torch.bool),
+            torch.ones((Bw,), device=device, dtype=torch.bool),
+        ],
+        dim=0,
+    )
     return x_aug, y_aug, cens_aug, is_warp
+
