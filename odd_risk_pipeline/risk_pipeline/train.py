@@ -71,15 +71,41 @@ def train_gate_one_epoch_raw(
     feature_index: Dict[str, int],
     gate_mean: torch.Tensor,
     gate_std: torch.Tensor,
+    *,
+    gate_mask_idx: Optional[torch.Tensor] = None,
+    gate_mask_fill: str = "zero",
 ) -> float:
+    """Train Gate for one epoch.
+
+    Gate-input masking:
+      - Keep range/closing in RAW for warp/relabeling.
+      - Mask them in SCALED space so the gate model cannot trivially reconstruct y_gate.
+    """
     model.train()
     total, n = 0.0, 0
+    fill = (gate_mask_fill or "zero").lower()
+
     for batch in loader:
         x_raw = batch["x_gate_raw"].to(cfg.device)
         y = batch["y_gate"].to(cfg.device)
 
         x_aug_raw, y_aug, _ = kinematic_warp_raw_x_gate(x_raw, y, feature_index, warp_cfg)
         x_aug = _scale(x_aug_raw, gate_mean, gate_std)
+
+        if gate_mask_idx is not None:
+            # accept torch.Tensor indices or python list/tuple of ints
+            if isinstance(gate_mask_idx, torch.Tensor):
+                if gate_mask_idx.numel() > 0:
+                    if fill in ("zero", "mean"):
+                        x_aug[:, gate_mask_idx] = 0.0
+                    else:
+                        raise ValueError(f"Unsupported gate_mask_fill={gate_mask_fill!r}. Use 'zero' or 'mean'.")
+            else:
+                if len(gate_mask_idx) > 0:
+                    if fill in ("zero", "mean"):
+                        x_aug[:, gate_mask_idx] = 0.0
+                    else:
+                        raise ValueError(f"Unsupported gate_mask_fill={gate_mask_fill!r}. Use 'zero' or 'mean'.")
 
         if cfg.input_noise > 0:
             x_aug = x_aug + torch.randn_like(x_aug) * cfg.input_noise
@@ -104,15 +130,37 @@ def eval_gate_raw(
     device: str,
     gate_mean: torch.Tensor,
     gate_std: torch.Tensor,
+    *,
+    gate_mask_idx: Optional[torch.Tensor] = None,
+    gate_mask_fill: str = "zero",
 ) -> float:
     model.eval()
     total, n = 0.0, 0
+    fill = (gate_mask_fill or "zero").lower()
+
     for batch in loader:
         x_raw = batch["x_gate_raw"].to(device)
         y = batch["y_gate"].to(device)
+
         x = _scale(x_raw, gate_mean, gate_std)
+
+        if gate_mask_idx is not None:
+            if isinstance(gate_mask_idx, torch.Tensor):
+                if gate_mask_idx.numel() > 0:
+                    if fill in ("zero", "mean"):
+                        x[:, gate_mask_idx] = 0.0
+                    else:
+                        raise ValueError(f"Unsupported gate_mask_fill={gate_mask_fill!r}. Use 'zero' or 'mean'.")
+            else:
+                if len(gate_mask_idx) > 0:
+                    if fill in ("zero", "mean"):
+                        x[:, gate_mask_idx] = 0.0
+                    else:
+                        raise ValueError(f"Unsupported gate_mask_fill={gate_mask_fill!r}. Use 'zero' or 'mean'.")
+
         logits = model(x)
-        loss = torch.nn.functional.binary_cross_entropy_with_logits(logits, y, reduction="mean")
+        loss = focal_loss_with_logits(logits, y, alpha=0.25, gamma=2.0)
+
         total += float(loss.item())
         n += 1
     return total / max(n, 1)
@@ -139,30 +187,71 @@ def train_expert_one_epoch_raw(
     ctx_block_drop_prob: float = 0.0,
     flow_x_idx: Optional[Union[torch.Tensor, List[int]]] = None,
     flow_c_idx: Optional[Union[torch.Tensor, List[int]]] = None,
-    # --- Expert raw-space warp augmentation (optional) ---
-    expert_warp_cfg: Optional[RawWarpConfig] = None,
+    # --- NEW: Expert warp (label-consistent) ---
+    warp_cfg: Optional[RawWarpConfig] = None,
     expert_feature_index: Optional[Dict[str, int]] = None,
-    # Needed to rebuild y in *standardized logTTC-space* when warping.
     ttc_floor_s: float = 0.05,
     ttc_cap_s: float = 10.0,
-    target_mu_y: float = 0.0,
-    target_sigma_y: float = 1.0,
+    target_mu_y: Optional[float] = None,
+    target_sigma_y: Optional[float] = None,
 ) -> float:
+    """Train Expert/Flow for one epoch.
+
+    Notes
+    -----
+    - Expert warp (if enabled) MUST regenerate y_expert consistently.
+      We do warp in RAW space BEFORE scaling, then scale using (expert_mean, expert_std).
+    - Fine-tuning on clean data is done by calling this with warp_cfg=None (or p_warp=0).
+    """
     flow.train()
     total, n = 0.0, 0
     for batch in loader:
         if batch["x_expert_raw"].numel() == 0:
             continue
-        x_raw = batch["x_expert_raw"].to(cfg.device)
-        y = batch["y_expert"].to(cfg.device)
-        m = batch["expert_mask"].to(cfg.device)
 
-        # Hard feature dropping for Expert (e.g., remove segment-fingerprint c__ continuous stats)
+        x_raw_full = batch["x_expert_raw"].to(cfg.device)
+        y_full = batch["y_expert"].to(cfg.device)
+        m_full = batch["expert_mask"].to(cfg.device)
+        cens_full = batch["censored_mask"].to(cfg.device)
+
+        keep = (m_full > 0.5)
+        if keep.sum() < 2:
+            continue
+
+        # Work on Expert-valid rows only
+        x_raw = x_raw_full[keep]
+        y = y_full[keep]
+        censored_mask = cens_full[keep]
+
+        # -----------------------------------------
+        # (Optional) label-consistent Expert warping
+        # -----------------------------------------
+        if warp_cfg is not None and float(getattr(warp_cfg, "p_warp", 0.0)) > 0.0:
+            if expert_feature_index is None:
+                raise ValueError("expert_feature_index must be provided when warp_cfg is enabled for Expert.")
+            if target_mu_y is None or target_sigma_y is None:
+                raise ValueError("target_mu_y/target_sigma_y must be provided when warp_cfg is enabled for Expert.")
+
+            x_raw, y, censored_mask, _ = kinematic_warp_raw_x_expert(
+                x_raw,
+                y,
+                censored_mask,
+                expert_feature_index,
+                warp_cfg,
+                ttc_floor_s=float(ttc_floor_s),
+                ttc_cap_s=float(ttc_cap_s),
+                target_mu_y=float(target_mu_y),
+                target_sigma_y=float(target_sigma_y),
+            )
+
+        # -----------------------------------------
+        # Hard feature dropping (context fingerprint)
+        # -----------------------------------------
         if drop_idx is not None and drop_idx.numel() > 0:
             x_raw = x_raw.clone()
             x_raw[:, drop_idx] = expert_mean[drop_idx]
 
-        # Structured context dropout: randomly neutralize *all* context features (c__ block)
+        # Structured context dropout (entire c__ block)
         if ctx_block_drop_prob > 0 and ctx_all_idx is not None and ctx_all_idx.numel() > 0:
             drop_mask = (torch.rand((x_raw.shape[0],), device=cfg.device) < ctx_block_drop_prob)
             if drop_mask.any():
@@ -170,52 +259,25 @@ def train_expert_one_epoch_raw(
                 rows = drop_mask.nonzero(as_tuple=True)[0]
                 x_raw[rows.unsqueeze(1), ctx_all_idx.unsqueeze(0)] = expert_mean[ctx_all_idx].unsqueeze(0)
 
-        keep = (m > 0.5)
-        if keep.sum() < 2:
-            continue
-
-        # --- Expert raw-space warp augmentation (optional) ---
-        # Warp in RAW feature space and rebuild y_expert in standardized logTTC-space.
-        if expert_warp_cfg is not None and float(expert_warp_cfg.p_warp) > 0.0 and expert_feature_index is not None:
-            x_keep_raw = x_raw[keep]
-            y_keep = y[keep]
-            cens_keep = batch["censored_mask"].to(cfg.device)[keep]
-            x_keep_raw, y_keep, cens_keep, _ = kinematic_warp_raw_x_expert(
-                x_keep_raw,
-                y_keep,
-                cens_keep,
-                expert_feature_index,
-                expert_warp_cfg,
-                ttc_floor_s=float(ttc_floor_s),
-                ttc_cap_s=float(ttc_cap_s),
-                target_mu_y=float(target_mu_y),
-                target_sigma_y=float(target_sigma_y),
-            )
-            x_raw_keep = x_keep_raw
-            y_k_full = y_keep
-            cens_full = (cens_keep > 0.5)
-        else:
-            x_raw_keep = x_raw[keep]
-            y_k_full = y[keep]
-            cens_full = (batch["censored_mask"].to(cfg.device)[keep] > 0.5)
-
-        x_scaled_full = _scale(x_raw_keep, expert_mean, expert_std)
+        # -----------------------------------------
+        # Scale + noise
+        # -----------------------------------------
+        x_scaled_full = (x_raw - expert_mean) / (expert_std + 1e-6)
         if cfg.input_noise > 0:
             x_scaled_full = x_scaled_full + torch.randn_like(x_scaled_full) * cfg.input_noise
 
         cond = _make_flow_cond(x_scaled_full, flow, flow_x_idx=flow_x_idx, flow_c_idx=flow_c_idx)
 
-        is_censored = cens_full
-        loss_val = torch.zeros_like(y_k_full)
-        y_k = y_k_full
+        is_censored = (censored_mask > 0.5)
+        loss_val = torch.zeros_like(y)
 
         mask_u = ~is_censored
         if mask_u.any():
-            loss_val[mask_u] = -flow.log_prob(y_k[mask_u], _cond_index(cond, mask_u))
+            loss_val[mask_u] = -flow.log_prob(y[mask_u], _cond_index(cond, mask_u))
 
         mask_c = is_censored
         if mask_c.any():
-            u, _ = flow.y_to_u(y_k[mask_c], _cond_index(cond, mask_c))
+            u, _ = flow.y_to_u(y[mask_c], _cond_index(cond, mask_c))
             surv = 0.5 * torch.erfc(u / 1.41421356)
             surv = torch.clamp(surv, min=1e-6)
             loss_val[mask_c] = -torch.log(surv)

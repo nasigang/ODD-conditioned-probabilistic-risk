@@ -30,6 +30,23 @@ import torch
 import matplotlib.pyplot as plt
 from torch.distributions import Normal
 
+def load_model_meta(run_dir: str):
+    p = os.path.join(run_dir, "model_meta.json")
+    if not os.path.exists(p):
+        return None
+    with open(p, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def assert_feature_order_or_die(meta, gate_cols, expert_cols):
+    if meta is None:
+        return
+    mg = meta.get("gate_cols_in_order")
+    me = meta.get("expert_cols_in_order")
+    if mg is not None and list(mg) != list(gate_cols):
+        raise RuntimeError("[STRICT] Gate feature order mismatch (training vs current schema).")
+    if me is not None and list(me) != list(expert_cols):
+        raise RuntimeError("[STRICT] Expert feature order mismatch (training vs current schema).")
+
 from risk_pipeline.preprocess import load_preprocess_state, transform_dataframe
 from risk_pipeline.data import RiskCSVDataset
 from risk_pipeline.models import GateMLP, ConditionalSpline1DFlow
@@ -697,6 +714,12 @@ def main():
 
     df_t = transform_dataframe(df, state, ttc_floor=args.ttc_floor, ttc_cap=args.ttc_cap)
     ds = RiskCSVDataset(df_t, state, ttc_floor=args.ttc_floor, ttc_cap=args.ttc_cap)
+
+    meta = load_model_meta(run_dir)
+    gate_cols = ds.get_x_gate_colnames()
+    expert_cols = ds.get_x_expert_colnames()
+    assert_feature_order_or_die(meta, gate_cols, expert_cols)
+
 
     device = torch.device(args.device)
     gate, flow = _load_models_for_run(run_dir, state, device=device)

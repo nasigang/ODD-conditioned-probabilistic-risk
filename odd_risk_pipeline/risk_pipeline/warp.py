@@ -21,7 +21,9 @@ B) Physics-gated labeling
    - We recompute y_gate from warped (range, closing speed) using the same thresholds as preprocess.
    - This produces useful hard negatives.
 
-This file intentionally only touches Gate inputs/labels. Expert training is unchanged.
+This module provides raw-space warping for BOTH Gate and Expert training.
+Gate warp: augments negative gate samples with physics-gated relabeling.
+Expert warp: augments expert samples AND regenerates y_expert (standardized logTTC) consistently.
 """
 
 from dataclasses import dataclass

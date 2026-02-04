@@ -137,7 +137,11 @@ class RiskCSVDataset(Dataset):
         raw_closing_speed_mps = torch.tensor(rc, dtype=torch.float32)
 
         seg_ids = self.df["segment_id"].astype(str).tolist()
-        frame_label = torch.tensor(self.df["frame_label"].to_numpy(np.int64), dtype=torch.int64)
+        if "frame_label" in self.df.columns:
+            frame_label = torch.tensor(self.df["frame_label"].to_numpy(np.int64), dtype=torch.int64)
+        else:
+            # Fallback: if frame_label is absent, default to 0 for all rows.
+            frame_label = torch.zeros((len(self.df),), dtype=torch.int64)
 
         # --- Censoring mask ---
         # Identify samples where TTC was clipped to ttc_cap (right-censored).

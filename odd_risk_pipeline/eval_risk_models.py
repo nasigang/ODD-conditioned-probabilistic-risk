@@ -15,6 +15,7 @@ Key compat fixes vs v1:
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 
@@ -25,6 +26,40 @@ import torch
 import re
 from typing import Dict, List, Tuple, Iterable
 
+
+def load_model_meta(run_dir: str):
+    p = os.path.join(run_dir, "model_meta.json")
+    if not os.path.exists(p):
+        return None
+    with open(p, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def assert_feature_order_or_die(meta, gate_cols, expert_cols):
+    if meta is None:
+        return
+    mg = meta.get("gate_cols_in_order")
+    me = meta.get("expert_cols_in_order")
+    if mg is not None and list(mg) != list(gate_cols):
+        raise RuntimeError("[STRICT] Gate feature order mismatch (training vs current schema). Refusing to run.")
+    if me is not None and list(me) != list(expert_cols):
+        raise RuntimeError("[STRICT] Expert feature order mismatch (training vs current schema). Refusing to run.")
+
+def build_gate_mask_from_meta(meta, gate_cols):
+    if meta is None or bool(meta.get("disable_gate_input_mask", False)):
+        return None, "mean"
+    fill = str(meta.get("gate_input_mask_fill", "mean"))
+    names = meta.get("gate_input_mask_names", [])
+    if names:
+        missing = [c for c in names if c not in gate_cols]
+        if missing:
+            raise RuntimeError(f"[STRICT] Gate mask features missing in current schema: {missing[:10]}")
+        idx = [gate_cols.index(c) for c in names]
+        return torch.tensor(idx, dtype=torch.long), fill
+    import re as _re
+    mask_re = _re.compile(str(meta.get("gate_input_mask_regex", "(^x__min_range_.*)|(^x__max_closing_speed_.*)")))
+    names2 = [c for c in gate_cols if mask_re.search(c)]
+    idx = [gate_cols.index(c) for c in names2]
+    return (torch.tensor(idx, dtype=torch.long) if idx else None), fill
 
 def gate_threshold_for_target_recall(
     p_gate: np.ndarray,
@@ -752,6 +787,8 @@ def infer_gate_probs(
     *,
     device: torch.device,
     batch: int,
+    gate_mask_idx: Optional[torch.Tensor] = None,
+    gate_mask_fill: str = "mean",
 ) -> np.ndarray:
     n = x_gate_raw.shape[0]
     out = np.empty((n,), dtype=np.float32)
@@ -763,6 +800,15 @@ def infer_gate_probs(
     for i0 in range(0, n, batch):
         i1 = min(n, i0 + batch)
         xg_raw = x_gate_raw[i0:i1].to(device)
+
+        if gate_mask_idx is not None and gate_mask_idx.numel() > 0:
+            xg_raw = xg_raw.clone()
+            if gate_mask_fill == "mean":
+                xg_raw[:, gate_mask_idx] = gate_mean[gate_mask_idx].unsqueeze(0)
+            elif gate_mask_fill == "zero":
+                xg_raw[:, gate_mask_idx] = 0.0
+            else:
+                raise ValueError(f"Unknown gate_mask_fill={gate_mask_fill} (expected mean or zero).")
         xg = (xg_raw - gate_mean) / (gate_std + 1e-6)
         logits = gate(xg).reshape(-1)
         out[i0:i1] = torch.sigmoid(logits).float().detach().cpu().numpy()
@@ -1109,6 +1155,14 @@ def main():
         # dataset (raw tensors)
         ds = RiskCSVDataset(df_t, state, ttc_floor=args.ttc_floor, ttc_cap=args.ttc_cap)
 
+
+        meta = load_model_meta(run_dir)
+        gate_cols = ds.get_x_gate_colnames()
+        expert_cols = ds.get_x_expert_colnames()
+        assert_feature_order_or_die(meta, gate_cols, expert_cols)
+        gate_mask_idx_t, gate_mask_fill = build_gate_mask_from_meta(meta, gate_cols)
+
+
         # scaling tensors (train-based mean/std; binary/onehot are identity)
         scale = ds.get_scale_tensors("cpu")
         gate_mean, gate_std = scale["gate_mean"], scale["gate_std"]
@@ -1202,6 +1256,8 @@ def main():
             gate_std,
             device=device,
             batch=args.batch,
+            gate_mask_idx=gate_mask_idx_t,
+            gate_mask_fill=gate_mask_fill,
         )
 
         # inference: expert -> p_event
