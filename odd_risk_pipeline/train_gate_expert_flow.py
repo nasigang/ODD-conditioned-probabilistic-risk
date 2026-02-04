@@ -9,7 +9,58 @@ import os
 import re
 from typing import Dict, List, Tuple, Iterable, Optional
 
-PATCH_ID = "proxygate_v13_fix_maskidx_no_device"
+
+# -----------------------------
+# Gate temperature scaling helpers
+# -----------------------------
+@torch.no_grad()
+def _collect_gate_logits_and_targets(
+    gate: GateMLP,
+    loader,
+    gate_mean: torch.Tensor,
+    gate_std: torch.Tensor,
+    device: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Collect uncalibrated gate logits and targets from a loader."""
+    gate.eval()
+    logits_all: List[torch.Tensor] = []
+    y_all: List[torch.Tensor] = []
+    for batch in loader:
+        x_raw = batch["x_gate_raw"].to(device)
+        y = batch["y_gate"].to(device).float()
+        x = (x_raw - gate_mean) / (gate_std + 1e-12)
+        logits = gate(x).view(-1)
+        logits_all.append(logits.detach().cpu())
+        y_all.append(y.view(-1).detach().cpu())
+    return torch.cat(logits_all, dim=0), torch.cat(y_all, dim=0)
+
+def _fit_gate_temperature(
+    logits: torch.Tensor,
+    y: torch.Tensor,
+    init_temperature: float = 1.0,
+    max_iter: int = 50,
+) -> float:
+    """Fit a single temperature T>0 minimizing BCE(logits/T, y) on validation data."""
+    logits = logits.detach().float()
+    y = y.detach().float()
+    # Optimize log(T) to enforce positivity.
+    log_T = torch.nn.Parameter(torch.log(torch.tensor([init_temperature], dtype=torch.float32)))
+    bce = torch.nn.BCEWithLogitsLoss(reduction="mean")
+
+    optimizer = torch.optim.LBFGS([log_T], lr=0.2, max_iter=max_iter, line_search_fn="strong_wolfe")
+
+    def closure():
+        optimizer.zero_grad(set_to_none=True)
+        T = torch.exp(log_T)
+        loss = bce(logits / T, y)
+        loss.backward()
+        return loss
+
+    optimizer.step(closure)
+    T = float(torch.exp(log_T).item())
+    # Clamp to a reasonable range to avoid pathological outputs if val set is tiny.
+    T = float(max(0.05, min(20.0, T)))
+    return T
 
 def _parse_csv_list(s: str) -> List[str]:
     if not s:
@@ -138,35 +189,11 @@ def main():
     ap.add_argument("--gate_candidate_range_m", type=float, default=50.0)
     ap.add_argument("--gate_closing_thr_mps", type=float, default=0.5)
     ap.add_argument("--gate_ttc_max_s", type=float, default=8.0)
-    # --- Gate input masking (proxy-gate) ---
-    ap.add_argument(
-        "--gate_input_mask_regex",
-        type=str,
-        default="^(x__min_range_.*|x__max_closing_speed_.*)$",
-        help="Regex for gate input columns to be masked in scaled space (still available for warp/relabel).",
-    )
-    ap.add_argument(
-        "--gate_input_mask_fill",
-        type=str,
-        default="zero",
-        choices=["zero", "mean"],
-        help="How to fill masked gate inputs in scaled space (both map to 0 after standardization).",
-    )
-    ap.add_argument(
-        "--disable_gate_input_mask",
-        action="store_true",
-        help="Disable gate input masking (NOT recommended; gate becomes near-deterministic).",
-    )
 
     # --- Warp controls ---
     ap.add_argument("--warp_p", type=float, default=0.35, help="(Backward compatible) default warp probability used for both Gate & Expert unless overridden.")
     ap.add_argument("--gate_warp_p", type=float, default=None, help="Override Gate warp probability only.")
     ap.add_argument("--expert_warp_p", type=float, default=None, help="Override Expert warp probability only (pretrain stage).")
-    ap.add_argument("--expert_warp_closing_add_min", type=float, default=None, help="Override Expert warp closing_add_min only.")
-    ap.add_argument("--expert_warp_closing_add_max", type=float, default=None, help="Override Expert warp closing_add_max only.")
-    ap.add_argument("--expert_warp_speed_scale_min", type=float, default=None, help="Override Expert warp speed_scale_min only.")
-    ap.add_argument("--expert_warp_speed_scale_max", type=float, default=None, help="Override Expert warp speed_scale_max only.")
-
 
     ap.add_argument("--warp_closing_add_min", type=float, default=0.5, help="Warp: additive closing speed min (m/s)")
     ap.add_argument("--warp_closing_add_max", type=float, default=6.0, help="Warp: additive closing speed max (m/s)")
@@ -191,6 +218,15 @@ def main():
     ap.add_argument("--test_ratio", type=float, default=0.15)
 
     ap.add_argument("--gate_epochs", type=int, default=30)
+
+
+    # Gate calibration (temperature scaling on VAL)
+    ap.add_argument("--disable_gate_temperature_scaling", action="store_true",
+                    help="Disable post-hoc temperature scaling for Gate logits.")
+    ap.add_argument("--gate_temperature_init", type=float, default=1.0,
+                    help="Initial temperature value for scaling (T>0).")
+    ap.add_argument("--gate_temperature_max_iter", type=int, default=50,
+                    help="Max LBFGS iterations for temperature scaling fit.")
     ap.add_argument("--expert_epochs", type=int, default=1, help="Expert pretrain epochs (WITH warp if expert_warp_p>0). Set to 1 for Strategy A.")
     ap.add_argument("--expert_finetune_epochs", type=int, default=3, help="Additional Expert fine-tuning epochs on CLEAN data only (warp disabled).")
 
@@ -279,34 +315,6 @@ def main():
 
     ds_train = RiskCSVDataset(df_train_t, state, ttc_floor=args.ttc_floor, ttc_cap=args.ttc_cap)
     ds_val = RiskCSVDataset(df_val_t, state, ttc_floor=args.ttc_floor, ttc_cap=args.ttc_cap)
-    # Gate input masking indices (computed from gate column names)
-    gate_mask_idx_t = None
-    if not bool(getattr(args, "disable_gate_input_mask", False)):
-        mask_re = re.compile(str(getattr(args, "gate_input_mask_regex", "")))
-        gate_cols = ds_train.get_x_gate_colnames()
-        mask_idx = [i for i, c in enumerate(gate_cols) if mask_re.search(c)]
-        if len(mask_idx) > 0:
-            gate_mask_idx_t = mask_idx  # python list; avoids device ordering issues
-        print(f"[gate_mask] enabled: regex={getattr(args,'gate_input_mask_regex','')} masked_cols={len(mask_idx)}")
-    else:
-        print("[gate_mask] disabled")
-    # Persist model meta (feature order + masking) for strict eval-time checks
-    model_meta = {
-        "patch_id": PATCH_ID,
-        "schema_profile": str(args.schema_profile),
-        "context_mode": str(args.context_mode),
-        "ttc_floor": float(args.ttc_floor),
-        "ttc_cap": float(args.ttc_cap),
-        "gate_cols_in_order": ds_train.get_x_gate_colnames(),
-        "expert_cols_in_order": ds_train.get_x_expert_colnames(),
-        "gate_input_mask": {
-            "enabled": (not bool(getattr(args, "disable_gate_input_mask", False))),
-            "regex": str(getattr(args, "gate_input_mask_regex", "")),
-            "fill": str(getattr(args, "gate_input_mask_fill", "zero")),
-        },
-    }
-    with open(out / "model_meta.json", "w", encoding="utf-8") as f:
-        json.dump(model_meta, f, indent=2)
 
     gate_sampler = SegmentBalancedBatchSampler(
         ds_train.get_segment_indices(),
@@ -365,7 +373,6 @@ def main():
         weight_decay=args.weight_decay,
         input_noise=args.input_noise,
     )
-    device = cfg.device
 
     scale_tensors = ds_train.get_scale_tensors(device)
     gate_mean, gate_std = scale_tensors["gate_mean"], scale_tensors["gate_std"]
@@ -397,8 +404,8 @@ def main():
     patience_limit = 5
 
     for ep in range(cfg.gate_epochs):
-        tr = train_gate_one_epoch_raw(gate, gate_loader, optimizer_g, cfg, gate_warp_cfg, gate_feature_index, gate_mean, gate_std, gate_mask_idx=gate_mask_idx_t, gate_mask_fill=args.gate_input_mask_fill)
-        va = eval_gate_raw(gate, gate_val_loader, device, gate_mean, gate_std, gate_mask_idx=gate_mask_idx_t, gate_mask_fill=args.gate_input_mask_fill)
+        tr = train_gate_one_epoch_raw(gate, gate_loader, optimizer_g, cfg, gate_warp_cfg, gate_feature_index, gate_mean, gate_std)
+        va = eval_gate_raw(gate, gate_val_loader, device, gate_mean, gate_std)
         scheduler_g.step(va)
 
         print(f"[Gate] epoch {ep+1}/{cfg.gate_epochs} train={tr:.4f} val={va:.4f} lr={optimizer_g.param_groups[0]['lr']:.2e}")
@@ -411,6 +418,35 @@ def main():
             if patience_counter >= patience_limit:
                 print(f"[Gate] Early stopping at epoch {ep+1}")
                 break
+
+
+
+    # -----------------------------
+    # Gate temperature scaling (VAL)
+    # -----------------------------
+    # Calibrates probabilities without changing ranking/AUC.
+    if not args.disable_gate_temperature_scaling:
+        # Load best checkpoint saved during early stopping.
+        if (out / "gate.pt").exists():
+            gate.load_state_dict(torch.load(out / "gate.pt", map_location=device))
+        gate.eval()
+
+        logits_val, y_val = _collect_gate_logits_and_targets(gate, gate_val_loader, gate_mean, gate_std, device)
+        nll_before = float(torch.nn.functional.binary_cross_entropy_with_logits(logits_val, y_val, reduction="mean").item())
+
+        T = _fit_gate_temperature(
+            logits_val,
+            y_val,
+            init_temperature=float(args.gate_temperature_init),
+            max_iter=int(args.gate_temperature_max_iter),
+        )
+        nll_after = float(torch.nn.functional.binary_cross_entropy_with_logits(logits_val / T, y_val, reduction="mean").item())
+        print(f"[Gate-Cal] temperature T={T:.3f}  NLL(before)={nll_before:.4f}  NLL(after)={nll_after:.4f}")
+
+        with open(out / "gate_temperature.json", "w", encoding="utf-8") as f:
+            json.dump({"temperature": float(T), "nll_before": nll_before, "nll_after": nll_after}, f, indent=2)
+    else:
+        print("[Gate-Cal] disabled (using raw logits)")
 
     # -----------------------------
     # Expert training: Two-stage A
@@ -458,18 +494,12 @@ def main():
 
     # Warp config for Expert pretrain
     expert_p = float(args.expert_warp_p) if args.expert_warp_p is not None else float(args.warp_p)
-
-    expert_closing_add_min = float(args.expert_warp_closing_add_min) if args.expert_warp_closing_add_min is not None else float(args.warp_closing_add_min)
-    expert_closing_add_max = float(args.expert_warp_closing_add_max) if args.expert_warp_closing_add_max is not None else float(args.warp_closing_add_max)
-    expert_speed_scale_min = float(args.expert_warp_speed_scale_min) if args.expert_warp_speed_scale_min is not None else float(args.warp_speed_scale_min)
-    expert_speed_scale_max = float(args.expert_warp_speed_scale_max) if args.expert_warp_speed_scale_max is not None else float(args.warp_speed_scale_max)
-
     expert_warp_cfg = RawWarpConfig(
         p_warp=expert_p,
-        closing_add_min=expert_closing_add_min,
-        closing_add_max=expert_closing_add_max,
-        speed_scale_min=expert_speed_scale_min,
-        speed_scale_max=expert_speed_scale_max,
+        closing_add_min=float(args.warp_closing_add_min),
+        closing_add_max=float(args.warp_closing_add_max),
+        speed_scale_min=float(args.warp_speed_scale_min),
+        speed_scale_max=float(args.warp_speed_scale_max),
         candidate_range_m=float(args.gate_candidate_range_m),
         closing_thr_mps=float(args.gate_closing_thr_mps),
         ttc_max_s=float(args.gate_ttc_max_s),

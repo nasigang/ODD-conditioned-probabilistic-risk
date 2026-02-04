@@ -15,7 +15,6 @@ Key compat fixes vs v1:
 import argparse
 import json
 import math
-import os
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 
@@ -26,40 +25,6 @@ import torch
 import re
 from typing import Dict, List, Tuple, Iterable
 
-
-def load_model_meta(run_dir: str):
-    p = os.path.join(run_dir, "model_meta.json")
-    if not os.path.exists(p):
-        return None
-    with open(p, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def assert_feature_order_or_die(meta, gate_cols, expert_cols):
-    if meta is None:
-        return
-    mg = meta.get("gate_cols_in_order")
-    me = meta.get("expert_cols_in_order")
-    if mg is not None and list(mg) != list(gate_cols):
-        raise RuntimeError("[STRICT] Gate feature order mismatch (training vs current schema). Refusing to run.")
-    if me is not None and list(me) != list(expert_cols):
-        raise RuntimeError("[STRICT] Expert feature order mismatch (training vs current schema). Refusing to run.")
-
-def build_gate_mask_from_meta(meta, gate_cols):
-    if meta is None or bool(meta.get("disable_gate_input_mask", False)):
-        return None, "mean"
-    fill = str(meta.get("gate_input_mask_fill", "mean"))
-    names = meta.get("gate_input_mask_names", [])
-    if names:
-        missing = [c for c in names if c not in gate_cols]
-        if missing:
-            raise RuntimeError(f"[STRICT] Gate mask features missing in current schema: {missing[:10]}")
-        idx = [gate_cols.index(c) for c in names]
-        return torch.tensor(idx, dtype=torch.long), fill
-    import re as _re
-    mask_re = _re.compile(str(meta.get("gate_input_mask_regex", "(^x__min_range_.*)|(^x__max_closing_speed_.*)")))
-    names2 = [c for c in gate_cols if mask_re.search(c)]
-    idx = [gate_cols.index(c) for c in names2]
-    return (torch.tensor(idx, dtype=torch.long) if idx else None), fill
 
 def gate_threshold_for_target_recall(
     p_gate: np.ndarray,
@@ -671,6 +636,19 @@ def load_models_for_run(run_dir: Path, state, device: torch.device):
     gate.load_state_dict(gate_sd, strict=True)
     gate.eval()
 
+    # Gate temperature scaling (optional): training may write gate_temperature.json
+    temp_json = run_dir / "gate_temperature.json"
+    if temp_json.exists():
+        try:
+            with open(temp_json, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+            t = float(obj.get("temperature", 1.0))
+            if np.isfinite(t) and t > 0.0:
+                gate._temperature = t
+                print(f"[gate] loaded temperature scaling T={t:.3f} from {temp_json.name}")
+        except Exception as e:
+            print(f"[gate][warn] failed to load gate_temperature.json: {e}")
+
     # Expert (Flow)
     flow_ckpt = run_dir / "expert_flow.pt"
     if not flow_ckpt.exists():
@@ -787,8 +765,6 @@ def infer_gate_probs(
     *,
     device: torch.device,
     batch: int,
-    gate_mask_idx: Optional[torch.Tensor] = None,
-    gate_mask_fill: str = "mean",
 ) -> np.ndarray:
     n = x_gate_raw.shape[0]
     out = np.empty((n,), dtype=np.float32)
@@ -797,21 +773,17 @@ def infer_gate_probs(
     gate_mean = gate_mean.to(device)
     gate_std = gate_std.to(device)
 
+    # Optional temperature scaling (saved by training as gate_temperature.json).
+    temperature = float(getattr(gate, "_temperature", 1.0))
+    if (not np.isfinite(temperature)) or temperature <= 0.0:
+        temperature = 1.0
+
     for i0 in range(0, n, batch):
         i1 = min(n, i0 + batch)
         xg_raw = x_gate_raw[i0:i1].to(device)
-
-        if gate_mask_idx is not None and gate_mask_idx.numel() > 0:
-            xg_raw = xg_raw.clone()
-            if gate_mask_fill == "mean":
-                xg_raw[:, gate_mask_idx] = gate_mean[gate_mask_idx].unsqueeze(0)
-            elif gate_mask_fill == "zero":
-                xg_raw[:, gate_mask_idx] = 0.0
-            else:
-                raise ValueError(f"Unknown gate_mask_fill={gate_mask_fill} (expected mean or zero).")
         xg = (xg_raw - gate_mean) / (gate_std + 1e-6)
         logits = gate(xg).reshape(-1)
-        out[i0:i1] = torch.sigmoid(logits).float().detach().cpu().numpy()
+        out[i0:i1] = torch.sigmoid(logits / temperature).float().detach().cpu().numpy()
     return out
 
 
@@ -972,12 +944,27 @@ def eval_flow_nll_and_pit(
     flow_c_idx: Optional[torch.Tensor],
     device: torch.device,
     batch: int,
+    pit_mode: str = "randomized",
+    pit_seed: int = 123,
 ) -> Tuple[float, float, float]:
-    """Match training loss logic and compute NLL + PIT.
+    """Match training loss logic and compute NLL + censoring-aware PIT.
 
-    - uncensored: -log_prob(y|cond)
-    - censored:   -log(survival(y|cond)) where survival = 1 - CDF
-    PIT is computed on uncensored only: PIT = CDF(y|cond)
+    Loss:
+      - uncensored: -log_prob(y|cond)
+      - censored:   -log(survival(y|cond)) where survival = 1 - CDF
+
+    PIT (Probability Integral Transform):
+      - uncensored: u = CDF(y|cond)
+      - censored (right-censor at y_cap): randomized PIT
+            u ~ Uniform(CDF(y_cap|cond), 1)
+
+    With heavy censoring, "uncensored-only PIT" is NOT a valid uniformity check
+    (it becomes a truncated sample). Randomized PIT restores a proper calibration
+    diagnostic under censoring.
+
+    pit_mode : {"randomized", "uncensored_only"}
+      - randomized (default): include censored samples using randomized PIT
+      - uncensored_only: legacy behavior for debugging/comparison
     """
     n = x_ctx_raw.shape[0]
     flow.eval()
@@ -996,6 +983,15 @@ def eval_flow_nll_and_pit(
         flow_c_idx = flow_c_idx.to(device)
 
     film_mode = bool(getattr(flow, "expects_tuple_condition", lambda: False)())
+
+    # RNG for randomized PIT (device-aware)
+    gen = None
+    if pit_mode == "randomized":
+        try:
+            gen = torch.Generator(device=device)
+        except Exception:
+            gen = torch.Generator()
+        gen.manual_seed(int(pit_seed))
 
     losses = []
     pits = []
@@ -1034,22 +1030,30 @@ def eval_flow_nll_and_pit(
         if mask_u.any():
             if film_mode:
                 loss_val[mask_u] = -flow.log_prob(yb[mask_u], (xb_cond[0][mask_u], xb_cond[1][mask_u]))
-                pit = flow.cdf(yb[mask_u], (xb_cond[0][mask_u], xb_cond[1][mask_u]))
+                pit_u = flow.cdf(yb[mask_u], (xb_cond[0][mask_u], xb_cond[1][mask_u]))
             else:
                 loss_val[mask_u] = -flow.log_prob(yb[mask_u], xb_cond[mask_u])
-                pit = flow.cdf(yb[mask_u], xb_cond[mask_u])
-            pits.append(pit.detach().cpu())
+                pit_u = flow.cdf(yb[mask_u], xb_cond[mask_u])
+            pits.append(pit_u.detach().cpu())
 
-        # censored: -log(survival)
+        # censored: -log(survival) (+ randomized PIT if enabled)
         mask_c = is_c
         if mask_c.any():
             if film_mode:
                 u, _ = flow.y_to_u(yb[mask_c], (xb_cond[0][mask_c], xb_cond[1][mask_c]))
             else:
                 u, _ = flow.y_to_u(yb[mask_c], xb_cond[mask_c])
+
             surv = 0.5 * torch.erfc(u / 1.41421356237)
             surv = torch.clamp(surv, min=1e-6)
             loss_val[mask_c] = -torch.log(surv)
+
+            if pit_mode == "randomized":
+                cdf_cap = 1.0 - surv
+                cdf_cap = torch.clamp(cdf_cap, 0.0, 1.0)
+                r = torch.rand(cdf_cap.shape, device=cdf_cap.device, generator=gen)
+                pit_c = cdf_cap + (1.0 - cdf_cap) * r
+                pits.append(pit_c.detach().cpu())
 
         losses.append(loss_val.mean().detach().cpu())
 
@@ -1061,8 +1065,6 @@ def eval_flow_nll_and_pit(
         pit_all = torch.cat(pits, dim=0).numpy()
         return nll, float(np.mean(pit_all)), float(np.std(pit_all))
     return nll, float("nan"), float("nan")
-
-
 # ----------------------------
 # Main evaluation
 # ----------------------------
@@ -1075,6 +1077,10 @@ def main():
     ap.add_argument("--split", default="val", choices=["train", "val", "test"], help="Which split to evaluate.")
     ap.add_argument("--ttc_floor", type=float, default=0.05)
     ap.add_argument("--ttc_cap", type=float, default=8.0)
+
+    ap.add_argument("--pit_mode", type=str, default="randomized", choices=["randomized", "uncensored_only"],
+                    help="PIT mode for Expert calibration. randomized is censoring-aware; uncensored_only reproduces legacy behavior.")
+    ap.add_argument("--pit_seed", type=int, default=123, help="Random seed used for randomized PIT (censored samples).")
 
     ap.add_argument("--x_to_c_regex", type=str, default="",
                     help="Comma-separated regex. Matching x__* columns will be renamed to c__* before preprocessing.")
@@ -1154,14 +1160,6 @@ def main():
 
         # dataset (raw tensors)
         ds = RiskCSVDataset(df_t, state, ttc_floor=args.ttc_floor, ttc_cap=args.ttc_cap)
-
-
-        meta = load_model_meta(run_dir)
-        gate_cols = ds.get_x_gate_colnames()
-        expert_cols = ds.get_x_expert_colnames()
-        assert_feature_order_or_die(meta, gate_cols, expert_cols)
-        gate_mask_idx_t, gate_mask_fill = build_gate_mask_from_meta(meta, gate_cols)
-
 
         # scaling tensors (train-based mean/std; binary/onehot are identity)
         scale = ds.get_scale_tensors("cpu")
@@ -1256,8 +1254,6 @@ def main():
             gate_std,
             device=device,
             batch=args.batch,
-            gate_mask_idx=gate_mask_idx_t,
-            gate_mask_fill=gate_mask_fill,
         )
 
         # inference: expert -> p_event
@@ -1319,6 +1315,8 @@ def main():
                 flow_c_idx=flow_c_idx_t,
                 device=device,
                 batch=args.batch,
+                pit_mode=args.pit_mode,
+                pit_seed=int(args.pit_seed),
             )
         else:
             # gaussian expert path (optional if your codebase has it)
