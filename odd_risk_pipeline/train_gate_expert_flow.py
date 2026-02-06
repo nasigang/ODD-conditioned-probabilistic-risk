@@ -188,7 +188,7 @@ def main():
     # Gate-label proxy thresholds (must match preprocess + warp labeling)
     ap.add_argument("--gate_candidate_range_m", type=float, default=50.0)
     ap.add_argument("--gate_closing_thr_mps", type=float, default=0.5)
-    ap.add_argument("--gate_ttc_max_s", type=float, default=8.0)
+    ap.add_argument("--gate_ttc_max_s", type=float, default=10.0)
 
     # --- Warp controls ---
     ap.add_argument("--warp_p", type=float, default=0.35, help="(Backward compatible) default warp probability used for both Gate & Expert unless overridden.")

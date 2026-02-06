@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Any, Tuple
 import numpy as np
 import pandas as pd
 import torch
+import matplotlib.pyplot as plt
 
 import re
 from typing import Dict, List, Tuple, Iterable
@@ -636,19 +637,6 @@ def load_models_for_run(run_dir: Path, state, device: torch.device):
     gate.load_state_dict(gate_sd, strict=True)
     gate.eval()
 
-    # Gate temperature scaling (optional): training may write gate_temperature.json
-    temp_json = run_dir / "gate_temperature.json"
-    if temp_json.exists():
-        try:
-            with open(temp_json, "r", encoding="utf-8") as f:
-                obj = json.load(f)
-            t = float(obj.get("temperature", 1.0))
-            if np.isfinite(t) and t > 0.0:
-                gate._temperature = t
-                print(f"[gate] loaded temperature scaling T={t:.3f} from {temp_json.name}")
-        except Exception as e:
-            print(f"[gate][warn] failed to load gate_temperature.json: {e}")
-
     # Expert (Flow)
     flow_ckpt = run_dir / "expert_flow.pt"
     if not flow_ckpt.exists():
@@ -773,17 +761,12 @@ def infer_gate_probs(
     gate_mean = gate_mean.to(device)
     gate_std = gate_std.to(device)
 
-    # Optional temperature scaling (saved by training as gate_temperature.json).
-    temperature = float(getattr(gate, "_temperature", 1.0))
-    if (not np.isfinite(temperature)) or temperature <= 0.0:
-        temperature = 1.0
-
     for i0 in range(0, n, batch):
         i1 = min(n, i0 + batch)
         xg_raw = x_gate_raw[i0:i1].to(device)
         xg = (xg_raw - gate_mean) / (gate_std + 1e-6)
         logits = gate(xg).reshape(-1)
-        out[i0:i1] = torch.sigmoid(logits / temperature).float().detach().cpu().numpy()
+        out[i0:i1] = torch.sigmoid(logits).float().detach().cpu().numpy()
     return out
 
 
@@ -944,27 +927,24 @@ def eval_flow_nll_and_pit(
     flow_c_idx: Optional[torch.Tensor],
     device: torch.device,
     batch: int,
-    pit_mode: str = "randomized",
-    pit_seed: int = 123,
-) -> Tuple[float, float, float]:
-    """Match training loss logic and compute NLL + censoring-aware PIT.
+    pit_seed: int = 0,
+) -> Tuple[float, float, float, np.ndarray]:
+    """Match censor-aware training loss and compute *randomized PIT*.
 
-    Loss:
-      - uncensored: -log_prob(y|cond)
-      - censored:   -log(survival(y|cond)) where survival = 1 - CDF
+    Loss (matches train.py censor-aware logic):
+      - uncensored:  -log p(y|cond)
+      - censored:    -log P(Y >= y_censor | cond)  (survival)
 
-    PIT (Probability Integral Transform):
-      - uncensored: u = CDF(y|cond)
-      - censored (right-censor at y_cap): randomized PIT
-            u ~ Uniform(CDF(y_cap|cond), 1)
+    Randomized PIT for right-censoring (submission metric):
+      - uncensored:  u = F(y|cond)
+      - censored:    u ~ Uniform(F(y_censor|cond), 1)
 
-    With heavy censoring, "uncensored-only PIT" is NOT a valid uniformity check
-    (it becomes a truncated sample). Randomized PIT restores a proper calibration
-    diagnostic under censoring.
-
-    pit_mode : {"randomized", "uncensored_only"}
-      - randomized (default): include censored samples using randomized PIT
-      - uncensored_only: legacy behavior for debugging/comparison
+    Returns
+    -------
+    nll : float
+    pit_mean : float
+    pit_std : float
+    pit_all : np.ndarray  (1D)
     """
     n = x_ctx_raw.shape[0]
     flow.eval()
@@ -984,14 +964,8 @@ def eval_flow_nll_and_pit(
 
     film_mode = bool(getattr(flow, "expects_tuple_condition", lambda: False)())
 
-    # RNG for randomized PIT (device-aware)
-    gen = None
-    if pit_mode == "randomized":
-        try:
-            gen = torch.Generator(device=device)
-        except Exception:
-            gen = torch.Generator()
-        gen.manual_seed(int(pit_seed))
+    g = torch.Generator(device=device)
+    g.manual_seed(int(pit_seed))
 
     losses = []
     pits = []
@@ -1025,7 +999,7 @@ def eval_flow_nll_and_pit(
 
         loss_val = torch.zeros_like(yb)
 
-        # uncensored: -log_prob + PIT
+        # uncensored: -log_prob + PIT=F(y)
         mask_u = ~is_c
         if mask_u.any():
             if film_mode:
@@ -1036,35 +1010,34 @@ def eval_flow_nll_and_pit(
                 pit_u = flow.cdf(yb[mask_u], xb_cond[mask_u])
             pits.append(pit_u.detach().cpu())
 
-        # censored: -log(survival) (+ randomized PIT if enabled)
+        # censored: -log(survival) + randomized PIT in [F(y_c), 1]
         mask_c = is_c
         if mask_c.any():
             if film_mode:
                 u, _ = flow.y_to_u(yb[mask_c], (xb_cond[0][mask_c], xb_cond[1][mask_c]))
+                cdf_c = flow.cdf(yb[mask_c], (xb_cond[0][mask_c], xb_cond[1][mask_c]))
             else:
                 u, _ = flow.y_to_u(yb[mask_c], xb_cond[mask_c])
-
+                cdf_c = flow.cdf(yb[mask_c], xb_cond[mask_c])
             surv = 0.5 * torch.erfc(u / 1.41421356237)
             surv = torch.clamp(surv, min=1e-6)
             loss_val[mask_c] = -torch.log(surv)
 
-            if pit_mode == "randomized":
-                cdf_cap = 1.0 - surv
-                cdf_cap = torch.clamp(cdf_cap, 0.0, 1.0)
-                r = torch.rand(cdf_cap.shape, device=cdf_cap.device, generator=gen)
-                pit_c = cdf_cap + (1.0 - cdf_cap) * r
-                pits.append(pit_c.detach().cpu())
+            r = torch.rand(cdf_c.shape, device=cdf_c.device, generator=g)
+            pit_c = cdf_c + (1.0 - cdf_c) * r
+            pits.append(pit_c.detach().cpu())
 
         losses.append(loss_val.mean().detach().cpu())
 
     if not losses:
-        return float("nan"), float("nan"), float("nan")
+        return float("nan"), float("nan"), float("nan"), np.zeros((0,), dtype=np.float32)
 
     nll = float(torch.stack(losses).mean().item())
     if pits:
-        pit_all = torch.cat(pits, dim=0).numpy()
-        return nll, float(np.mean(pit_all)), float(np.std(pit_all))
-    return nll, float("nan"), float("nan")
+        pit_all = torch.cat(pits, dim=0).numpy().astype('float32')
+        return nll, float(pit_all.mean()), float(pit_all.std()), pit_all
+    return nll, float("nan"), float("nan"), np.zeros((0,), dtype=np.float32)
+
 # ----------------------------
 # Main evaluation
 # ----------------------------
@@ -1078,10 +1051,6 @@ def main():
     ap.add_argument("--ttc_floor", type=float, default=0.05)
     ap.add_argument("--ttc_cap", type=float, default=8.0)
 
-    ap.add_argument("--pit_mode", type=str, default="randomized", choices=["randomized", "uncensored_only"],
-                    help="PIT mode for Expert calibration. randomized is censoring-aware; uncensored_only reproduces legacy behavior.")
-    ap.add_argument("--pit_seed", type=int, default=123, help="Random seed used for randomized PIT (censored samples).")
-
     ap.add_argument("--x_to_c_regex", type=str, default="",
                     help="Comma-separated regex. Matching x__* columns will be renamed to c__* before preprocessing.")
     ap.add_argument("--expert_drop_feature_regex", type=str, default="",
@@ -1093,6 +1062,19 @@ def main():
     ap.add_argument("--tau", type=float, default=0.5)
     ap.add_argument("--amax", type=float, default=6.0)
     ap.add_argument("--fixed_ttc", type=float, default=2.0)
+
+    # Main (paper) risk definition
+    ap.add_argument("--main_risk_def", default="quantile_tail", choices=["quantile_tail", "physical"],
+                    help="Main risk definition to report. quantile_tail (paper main) or physical (legacy).")
+    ap.add_argument("--tail_q", type=float, default=0.10, help="Quantile q for tail event threshold (default 0.10).")
+    ap.add_argument("--tail_q_source", default="train_candidates", choices=["train_candidates", "train_all"],
+                    help="Where to compute quantile on TRAIN: candidates only (expert_mask==1) or all rows.")
+    ap.add_argument("--appendix_physical", action="store_true",
+                    help="If main_risk_def=quantile_tail, also compute physical (TTC<=s*(v)) risk metrics for appendix.")
+    ap.add_argument("--paper_mode", action="store_true",
+                    help="ITSC paper mode: main risk=quantile_tail, randomized PIT only, and cleaner outputs.")
+    ap.add_argument("--pit_seed", type=int, default=0, help="Random seed for randomized PIT.")
+    ap.add_argument("--save_pit_hist", action="store_true", help="Save pit_hist.png (randomized PIT) in output dir.")
 
     # recommended: avoid labeling "events" where there is no interaction edge
     ap.add_argument("--require_edges", action="store_true", default=True)
@@ -1127,6 +1109,27 @@ def main():
     ap.add_argument("--no_save", action="store_true", help="Disable saving json/csv")
 
     args = ap.parse_args()
+
+    # ITSC paper mode defaults (can be overridden by explicit CLI args)
+    if getattr(args, 'paper_mode', False):
+        # main = quantile tail
+        if getattr(args, 'main_risk_def', None) is None:
+            args.main_risk_def = 'quantile_tail'
+        if getattr(args, 'tail_q', None) is None:
+            args.tail_q = 0.10
+        if getattr(args, 'tail_q_source', None) is None:
+            args.tail_q_source = 'train_candidates'
+        # export randomized PIT histogram by default
+        args.save_pit_hist = True
+        # keep physical risk as appendix for reviewers
+        args.appendix_physical = True
+
+
+    # Paper mode overrides: reviewer-proof defaults
+    if getattr(args, 'paper_mode', False):
+        args.main_risk_def = 'quantile_tail'
+        args.appendix_physical = True
+        args.save_pit_hist = True
 
     df_all = pd.read_csv(args.csv)
     assert "segment_id" in df_all.columns, "CSV must contain segment_id"
@@ -1213,9 +1216,16 @@ def main():
                 flow_c_idx_t = torch.tensor(list(range(x_dim, x_dim + c_dim)), dtype=torch.long)
                 print(f"[flow] built fallback split indices for FiLM: x={x_dim}, c={c_dim}")
 
-        # labels
+        # labels: gate label is always the training gate label
         y_gate_true = ds.tensors.y_gate.detach().cpu().numpy().astype(np.int64)
-        y_event = build_event_label(
+
+        # target standardization (train-based)
+        mu_y = float(getattr(state.target_std, 'mu_y', getattr(state.target_std, 'mean')))
+        sig_y = float(getattr(state.target_std, 'sigma_y', getattr(state.target_std, 'std')))
+        eps_y = float(getattr(state.target_std, "eps", 1e-6))
+
+        # --- physical event (appendix / legacy) ---
+        y_event_physical = build_event_label(
             df_t,
             ttc_floor=args.ttc_floor,
             ttc_cap=args.ttc_cap,
@@ -1228,8 +1238,7 @@ def main():
             y_gate_proxy=y_gate_true,
         )
 
-        # threshold (TTC seconds -> standardized log TTC for expert CDF query)
-        thr_ttc = build_event_threshold_ttc(
+        thr_ttc_physical = build_event_threshold_ttc(
             df_t,
             ttc_cap=args.ttc_cap,
             label_mode=args.label_mode,
@@ -1238,13 +1247,57 @@ def main():
             amax=args.amax,
             fixed_ttc=args.fixed_ttc,
         )
-        thr_ttc = np.clip(thr_ttc, args.ttc_floor, args.ttc_cap)
-        thr_log = np.log(thr_ttc + 1e-9)
-        mu_y = float(getattr(state.target_std, 'mu_y', getattr(state.target_std, 'mean')))
-        sig_y = float(getattr(state.target_std, 'sigma_y', getattr(state.target_std, 'std')))
-        eps_y = float(getattr(state.target_std, "eps", 1e-6))
-        y_thr_std = (thr_log - mu_y) / (sig_y + eps_y)
-        y_thr_std_t = torch.tensor(y_thr_std, dtype=torch.float32)
+        thr_ttc_physical = np.clip(thr_ttc_physical, args.ttc_floor, args.ttc_cap)
+        thr_log_physical = np.log(thr_ttc_physical + 1e-9)
+        y_thr_std_physical = (thr_log_physical - mu_y) / (sig_y + eps_y)
+        y_thr_std_physical_t = torch.tensor(y_thr_std_physical, dtype=torch.float32)
+
+        # --- main (paper) tail event definition (quantile-based) ---
+        ttc_q = None
+        y_thr_std_q = None
+        if args.main_risk_def == 'quantile_tail':
+            segs_train = split.get('train', [])
+            if not segs_train:
+                raise RuntimeError('segment_split.json must contain a train split for quantile-tail risk')
+            df_train = pick_split_df(df_all, segs_train)
+            if 'frame_label' not in df_train.columns:
+                df_train['frame_label'] = np.arange(len(df_train), dtype=np.int64)
+            df_train_t = transform_dataframe(df_train, state, ttc_floor=args.ttc_floor, ttc_cap=args.ttc_cap)
+            m_q = np.ones((len(df_train_t),), dtype=bool)
+            if args.tail_q_source == 'train_candidates':
+                m_q = (pd.to_numeric(df_train_t.get('expert_mask', 0), errors='coerce').fillna(0.0).to_numpy() > 0.5)
+            y_train_std = pd.to_numeric(df_train_t.get('y_expert', np.nan), errors='coerce').to_numpy(np.float64)
+            y_train_log = y_train_std * (sig_y + eps_y) + mu_y
+            ttc_train = np.clip(np.exp(y_train_log), args.ttc_floor, args.ttc_cap)
+            if int(m_q.sum()) < 10:
+                raise RuntimeError(f'Not enough rows to compute tail quantile on {args.tail_q_source}: n={int(m_q.sum())}')
+            ttc_q = float(np.quantile(ttc_train[m_q], float(args.tail_q)))
+            ttc_q = float(np.clip(ttc_q, args.ttc_floor, args.ttc_cap))
+            y_thr_std_q = float((np.log(ttc_q + 1e-9) - mu_y) / (sig_y + eps_y))
+
+        if args.main_risk_def == 'quantile_tail':
+            y_thr_std_t = torch.full((len(ds),), float(y_thr_std_q), dtype=torch.float32)
+            y_event = (ds.tensors.y_expert.detach().cpu().numpy() <= float(y_thr_std_q)).astype(np.int64)
+            if args.require_edges:
+                m_edges = (ds.tensors.expert_mask.detach().cpu().numpy() > 0.5)
+                y_event = (y_event.astype(bool) & m_edges).astype(np.int64)
+            main_meta = {
+                'risk_def': 'quantile_tail',
+                'tail_q': float(args.tail_q),
+                'tail_q_source': str(args.tail_q_source),
+                'tail_ttc_threshold_s': float(ttc_q),
+            }
+        else:
+            y_thr_std_t = y_thr_std_physical_t
+            y_event = y_event_physical
+            main_meta = {
+                'risk_def': 'physical',
+                'physical_label_mode': str(args.label_mode),
+                'sstar_mode': str(args.sstar_mode),
+                'tau': float(args.tau),
+                'amax': float(args.amax),
+                'fixed_ttc': float(args.fixed_ttc),
+            }
 
         # inference: gate
         p_gate = infer_gate_probs(
@@ -1270,6 +1323,23 @@ def main():
                 device=device,
                 batch=args.batch,
             )
+
+            p_event_physical = None
+            risk_prob_physical = None
+            if args.appendix_physical and args.main_risk_def == 'quantile_tail':
+                p_event_physical = infer_flow_cdf_probs(
+                    expert,
+                    y_thr_std_physical_t,
+                    ds.tensors.x_expert_raw,
+                    expert_mean,
+                    expert_std,
+                    drop_idx=drop_idx_t,
+                    flow_x_idx=flow_x_idx_t,
+                    flow_c_idx=flow_c_idx_t,
+                    device=device,
+                    batch=args.batch,
+                )
+                risk_prob_physical = np.clip(p_gate * p_event_physical, 0.0, 1.0)
 
             # Strategy A: uncertainty σ_log (std in logTTC space) via sampling
             sigma_log = None
@@ -1302,7 +1372,7 @@ def main():
                     )
 
             # expert nll + PIT on expert training subset
-            expert_nll, pit_mean, pit_std = eval_flow_nll_and_pit(
+            expert_nll, pit_mean, pit_std, pit_all = eval_flow_nll_and_pit(
                 expert,
                 ds.tensors.y_expert,
                 ds.tensors.x_expert_raw,
@@ -1315,14 +1385,14 @@ def main():
                 flow_c_idx=flow_c_idx_t,
                 device=device,
                 batch=args.batch,
-                pit_mode=args.pit_mode,
                 pit_seed=int(args.pit_seed),
             )
         else:
             # gaussian expert path (optional if your codebase has it)
             # We can't guarantee output format, so we keep these as NaN unless you standardize it.
             p_event = np.full((len(ds),), np.nan, dtype=np.float32)
-            expert_nll, pit_mean, pit_std = float("nan"), float("nan"), float("nan")
+            expert_nll, pit_mean, pit_std = float('nan'), float('nan'), float('nan')
+            pit_all = np.zeros((0,), dtype=np.float32)
 
         # final risk prob
         risk_prob = np.clip(p_gate * p_event, 0.0, 1.0)
@@ -1334,6 +1404,9 @@ def main():
             "split": args.split,
             "N": int(len(df_t)),
             "pos_rate": float(np.mean(y_event)),
+
+            # risk definition (paper main)
+            **main_meta,
 
             # gate metrics (uses training gate label)
             "gate_pr_auc": _safe_prauc(y_gate_true, p_gate),
@@ -1360,6 +1433,24 @@ def main():
             "p_gate_mean": float(np.mean(p_gate)),
             "p_event_mean": float(np.mean(p_event)),
         }
+
+        # appendix: physical risk (optional)
+        if args.appendix_physical and args.main_risk_def == 'quantile_tail' and expert_type == 'flow' and ('p_event_physical' in locals()) and (p_event_physical is not None):
+            res['appendix_physical'] = {
+                'label_mode': str(args.label_mode),
+                'sstar_mode': str(args.sstar_mode),
+                'tau': float(args.tau),
+                'amax': float(args.amax),
+                'fixed_ttc': float(args.fixed_ttc),
+                'pos_rate': float(np.mean(y_event_physical)),
+                'risk_pr_auc': _safe_prauc(y_event_physical, risk_prob_physical),
+                'risk_roc_auc': _safe_auc(y_event_physical, risk_prob_physical),
+                'risk_brier': brier(y_event_physical, risk_prob_physical),
+                'risk_ece': ece(y_event_physical, risk_prob_physical),
+                'risk_mean': float(np.mean(risk_prob_physical)),
+                'p_event_mean': float(np.mean(p_event_physical)),
+            }
+
 
         # Strategy A outputs
         if "sigma_log" in locals() and sigma_log is not None:
@@ -1421,6 +1512,12 @@ def main():
             )
         res["ttc_bin_diag"] = bin_rows
 
+        # file suffix for submission artifacts
+        suf = (f"tailq{float(args.tail_q):.2f}".replace(".", "p")
+               if args.main_risk_def == "quantile_tail"
+               else str(args.label_mode))
+
+
         # save
         if not args.no_save:
             if args.save_dir:
@@ -1429,7 +1526,7 @@ def main():
                 out_dir = run_dir
             out_dir.mkdir(parents=True, exist_ok=True)
 
-            out_json = out_dir / f"eval_{args.split}_{args.label_mode}.json"
+            out_json = out_dir / f"eval_{args.split}_{suf}.json"
             with out_json.open("w", encoding="utf-8") as f:
                 json.dump(res, f, indent=2)
 
@@ -1437,7 +1534,7 @@ def main():
             if args.save_preds:
                 seg_id = df_t["segment_id"].astype(str).to_numpy()
                 frame = pd.to_numeric(df_t["frame_label"], errors="coerce").fillna(-1).to_numpy(np.int64)
-                out_npz = out_dir / f"preds_{args.split}_{args.label_mode}.npz"
+                out_npz = out_dir / f"preds_{args.split}_{suf}.npz"
                 npz_kwargs = dict(
                     segment_id=seg_id,
                     frame_label=frame,
@@ -1452,6 +1549,18 @@ def main():
                     npz_kwargs["gate_thr_for_sigma"] = np.array([gate_thr_for_sigma], dtype=np.float32)
                 np.savez_compressed(out_npz, **npz_kwargs)
 
+            # Save randomized PIT histogram (censoring-aware)
+            if args.save_pit_hist and expert_type == 'flow' and (pit_all is not None) and (getattr(pit_all, 'size', 0) > 0):
+                fig_path = out_dir / f"pit_hist_{args.split}_{suf}.png"
+                plt.figure()
+                plt.hist(pit_all, bins=20)
+                plt.xlabel('Randomized PIT')
+                plt.ylabel('Count')
+                plt.title('Randomized PIT histogram (censoring-aware)')
+                plt.tight_layout()
+                plt.savefig(fig_path)
+                plt.close()
+
         all_results[str(run_dir)] = res
 
         print(
@@ -1461,9 +1570,9 @@ def main():
         )
         if not args.no_save:
             if args.save_dir:
-                print("saved:", str((Path(args.save_dir) / run_dir.name / f"eval_{args.split}_{args.label_mode}.json")))
+                print("saved:", str((Path(args.save_dir) / run_dir.name / f"eval_{args.split}_{suf}.json")))
             else:
-                print("saved:", str(run_dir / f"eval_{args.split}_{args.label_mode}.json"))
+                print("saved:", str(run_dir / f"eval_{args.split}_{suf}.json"))
 
     # summary table (printed)
     print("\n\n===== SUMMARY TABLE (risk_pr_auc / risk_brier / expert_nll) =====")
@@ -1499,10 +1608,10 @@ def main():
         else:
             base = Path(args.run[0])
         base.mkdir(parents=True, exist_ok=True)
-        df_sum.to_csv(base / f"eval_summary_{args.split}_{args.label_mode}.csv", index=False)
-        (base / f"eval_summary_{args.split}_{args.label_mode}.json").write_text(df_sum.to_json(orient="records", indent=2), encoding="utf-8")
+        suf_sum = (f"tailq{float(args.tail_q):.2f}".replace(".", "p") if args.main_risk_def=="quantile_tail" else str(args.label_mode))
+        df_sum.to_csv(base / f"eval_summary_{args.split}_{suf_sum}.csv", index=False)
+        (base / f"eval_summary_{args.split}_{suf_sum}.json").write_text(df_sum.to_json(orient="records", indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":
     main()
-
